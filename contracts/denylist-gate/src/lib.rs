@@ -546,6 +546,16 @@ impl DenylistGate {
         Ok(())
     }
 
+    /// Returns `true` while admin mutations are paused. Mirrors
+    /// `allowlist-token::is_paused`. Reads `false` before `initialize` and
+    /// after `unpause`.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     /// Add `address` to the denylist. Admin or compliance-officer.
     ///
     /// Uses persistent storage with a long TTL to avoid fail-open archival.

@@ -416,6 +416,46 @@ fn test_remove_multiple_from_denylist_over_batch_limit_rejected() {
 }
 
 #[test]
+fn test_is_paused_tracks_pause_and_unpause() {
+    let env = Env::default();
+    let (admin, _, client) = setup(&env);
+    assert!(!client.is_paused());
+
+    client.pause(&admin);
+    assert!(client.is_paused());
+
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_is_paused_false_before_initialize() {
+    let env = Env::default();
+    let contract_id = env.register(DenylistGate, ());
+    let client = DenylistGateClient::new(&env, &contract_id);
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_is_paused_matches_mutation_rejection() {
+    let env = Env::default();
+    let (admin, _, client) = setup(&env);
+    let target = Address::generate(&env);
+
+    client.pause(&admin);
+    assert!(client.is_paused());
+    assert_eq!(
+        client.try_add_to_denylist(&admin, &target),
+        Err(Ok(Error::ContractPaused))
+    );
+
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+    client.add_to_denylist(&admin, &target);
+    assert!(!client.check(&target));
+}
+
+#[test]
 fn test_double_initialize_fails() {
     let env = Env::default();
     let (admin, _contract_id, client) = setup(&env);
