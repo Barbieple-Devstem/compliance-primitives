@@ -1017,3 +1017,21 @@ fn test_upgrade_cancel_event_includes_admin() {
     assert_eq!(data, Map::<Symbol, Val>::new(&env).into_val(&env));
     assert_eq!(events.last().unwrap().0, contract_id);
 }
+
+
+#[test]
+fn test_write_path_extends_instance_ttl() {
+    use soroban_sdk::testutils::storage::Instance as _;
+    let env = Env::default();
+    let (admin, _token, contract_id, client) = setup(&env);
+    let ttl = || env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert_eq!(ttl(), INSTANCE_TTL_EXTEND_TO);
+
+    let start = env.ledger().sequence();
+    env.ledger()
+        .set_sequence_number(start + INSTANCE_TTL_EXTEND_TO - INSTANCE_TTL_THRESHOLD + 10);
+    assert!(ttl() < INSTANCE_TTL_THRESHOLD);
+
+    client.add_to_allowlist(&admin, &Address::generate(&env), &None);
+    assert_eq!(ttl(), INSTANCE_TTL_EXTEND_TO);
+}

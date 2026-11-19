@@ -74,6 +74,13 @@ pub(crate) const ALLOWED_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
 /// Maximum number of addresses accepted by a batch allowlist operation.
 pub const MAX_BATCH_SIZE: u32 = 45;
 
+/// Instance-storage TTL policy: whenever the remaining instance TTL drops
+/// below [`INSTANCE_TTL_THRESHOLD`], it is bumped back up to
+/// [`INSTANCE_TTL_EXTEND_TO`]. Matches `compliance-aggregator`.
+pub const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
+/// Target instance TTL after an extension.
+pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -220,6 +227,7 @@ impl AllowlistToken {
     /// address of the underlying SEP-41 token contract that real transfers
     /// are forwarded to once both parties clear the allowlist check.
     pub fn initialize(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
@@ -471,6 +479,7 @@ impl AllowlistToken {
 
     /// Accept a pending admin transfer. Must be called by the proposed admin.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
         new_admin.require_auth();
 
         let pending_admin: Address = env
@@ -609,6 +618,7 @@ impl AllowlistToken {
     /// extend the entry's TTL; transfer checks refresh existing entries when
     /// their remaining TTL falls below the configured threshold.
     pub fn is_allowed(env: Env, address: Address) -> bool {
+        Self::extend_instance_ttl(&env);
         let entry: Option<AllowlistEntry> =
             env.storage().persistent().get(&DataKey::Allowed(address));
         match entry {
@@ -692,6 +702,7 @@ impl AllowlistToken {
     /// existing allowlist entry extends its TTL when it falls below the
     /// configured threshold.
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) -> Result<bool, Error> {
+        Self::extend_instance_ttl(&env);
         if amount < 0 {
             return Err(Error::InvalidInput);
         }
@@ -723,12 +734,21 @@ impl AllowlistToken {
     // Private helpers
     // -----------------------------------------------------------------------
 
+
+    /// Extends the instance entry TTL. Soroban does not extend instance TTL
+    /// implicitly on invocation, so every write path calls this explicitly.
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    }
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         admin.require_auth();
         Self::require_configured_admin(env, admin)
     }
 
     fn require_configured_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
         let stored_admin: Address = env
             .storage()
             .instance()

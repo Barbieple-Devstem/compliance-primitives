@@ -69,6 +69,13 @@ const MAX_BATCH_SIZE: u32 = 45;
 /// Minimum upgrade review window, approximately one day at five seconds per ledger.
 pub const MIN_UPGRADE_DELAY_LEDGERS: u32 = 17_280;
 
+/// Instance-storage TTL policy: whenever the remaining instance TTL drops
+/// below [`INSTANCE_TTL_THRESHOLD`], it is bumped back up to
+/// [`INSTANCE_TTL_EXTEND_TO`]. Matches `compliance-aggregator`.
+pub const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
+/// Target instance TTL after an extension.
+pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
+
 // ---------------------------------------------------------------------------
 // Storage
 // ---------------------------------------------------------------------------
@@ -87,6 +94,8 @@ enum DataKey {
     Denied(Address),
     PendingUpgrade,
     /// Approvals collected so far for one pending signer-set change.
+    /// Persistent storage (not instance), so abandoned proposals do not bloat
+    /// the instance entry that every call, including `check()`, loads.
     PendingSignerAction(SignerAction),
 }
 
@@ -101,13 +110,53 @@ pub struct UpgradeState {
 /// Current on-chain schema version for this contract instance.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// The M-of-N signer set.
+/// The M-of-N signer set, stored under `DataKey::SignerSet` in instance
+/// storage once `initialize_multisig` has run.
+///
+/// **Scope of the multisig layer.** The signer set only governs *itself*:
+/// `add_signer`, `remove_signer` and `set_threshold` each need `threshold`
+/// distinct approvals from current `signers` before they take effect.
+///
+/// It is **not** connected to denylist mutations or to the other admin
+/// operations. After `initialize_multisig`:
+///
+/// - `add_to_denylist`, `remove_from_denylist` and
+///   `remove_multiple_from_denylist` are still gated by the single-admin
+///   `require_compliance_authority` check, i.e. the `Admin` or the
+///   `ComplianceOfficer` alone can mutate the denylist.
+/// - `Admin` keeps every admin-only power (pause, officer assignment,
+///   audit-log configuration, upgrades, admin rotation). `ComplianceOfficer`
+///   is unchanged.
+/// - Signers have no denylist or admin rights by virtue of being signers.
+///
+/// Treat the signer set as a separate, currently-unconnected governance
+/// layer, not as a replacement for the admin key.
 #[contracttype]
 #[derive(Clone)]
 pub struct SignerSet {
+    /// Distinct addresses allowed to approve signer-set changes.
     pub signers: Vec<Address>,
+    /// Number of distinct current signers whose approval applies a change
+    /// (`1 <= threshold <= signers.len()`).
     pub threshold: u32,
 }
+
+/// Approvals collected for one pending `SignerAction`, stored in persistent
+/// storage under `DataKey::PendingSignerAction(action)`.
+#[contracttype]
+#[derive(Clone)]
+pub struct PendingApproval {
+    /// Signers that have approved the action so far.
+    pub approvals: Vec<Address>,
+    /// Ledger sequence at which the first approval was recorded.
+    pub created_ledger: u32,
+}
+
+/// Number of ledgers a pending signer-set approval stays valid after its
+/// first approval (~7 days at 5s per ledger). Once expired, collected
+/// approvals no longer count towards the threshold and the next approval
+/// starts a fresh proposal.
+pub const APPROVAL_TTL_LEDGERS: u32 = 120_960;
 
 /// A signer-set change that needs `threshold` distinct approvals to apply.
 #[contracttype]
@@ -120,6 +169,7 @@ pub enum SignerAction {
 
 #[contractclient(name = "AuditLogClient")]
 pub trait AuditLogInterface {
+
     fn record(env: Env, source: Address, kind: Symbol, subject: Address, detail: String);
 }
 
@@ -289,6 +339,7 @@ impl DenylistGate {
     /// One-time setup. Stores `admin` as the only address allowed to update
     /// the denylist afterward.
     pub fn initialize(env: Env, admin: Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
@@ -366,6 +417,7 @@ impl DenylistGate {
 
     /// Accept a pending admin transfer. Must be called by the proposed admin.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
         new_admin.require_auth();
         let pending_admin: Address = env
             .storage()
@@ -552,8 +604,9 @@ impl DenylistGate {
     ///
     /// Persistent denylist entries receive an explicit long TTL because their
     /// reads can happen independently of instance-storage activity. Instance
-    /// configuration keys do not need the same treatment: Soroban bumps the
-    /// instance entry TTL when this contract is invoked.
+    /// configuration keys (admin, pause flag, signer set, ...) are kept alive
+    /// separately: Soroban never extends instance TTL implicitly, so every
+    /// write path (and `check`) calls `extend_instance_ttl` explicitly.
     pub fn add_to_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
         Self::require_compliance_authority(&env, &admin)?;
@@ -617,6 +670,7 @@ impl DenylistGate {
     ///
     /// **Not** affected by pause state — reads always succeed.
     pub fn check(env: Env, address: Address) -> bool {
+        Self::extend_instance_ttl(&env);
         !env.storage()
             .persistent()
             .get(&DataKey::Denied(address))
@@ -644,6 +698,12 @@ impl DenylistGate {
     ///
     /// `signers` must be non-empty and free of duplicates, and `threshold`
     /// must be between 1 and `signers.len()`.
+    ///
+    /// This does **not** switch the contract into multisig mode for denylist
+    /// mutations: `add_to_denylist` / `remove_from_denylist` keep using the
+    /// single-admin (`Admin` or `ComplianceOfficer`) check, and `Admin`
+    /// retains all admin-only operations. The signer set only governs its own
+    /// membership and threshold. See [`SignerSet`].
     pub fn initialize_multisig(
         env: Env,
         admin: Address,
@@ -723,6 +783,36 @@ impl DenylistGate {
         Self::approve(&env, caller, SignerAction::SetThreshold(new_threshold), signer_set)
     }
 
+    /// Withdraw `caller`'s approval of a pending `action`. `caller` must
+    /// authorize the call and be in the current signer set. A no-op if there
+    /// is no pending approval from `caller`.
+    pub fn revoke_approval(env: Env, caller: Address, action: SignerAction) -> Result<(), Error> {
+        Self::require_signer(&env, &caller)?;
+        let key = DataKey::PendingSignerAction(action);
+        if let Some(mut pending) = Self::load_pending(&env, &key) {
+            let mut remaining = Vec::new(&env);
+            for approver in pending.approvals.iter() {
+                if approver != caller {
+                    remaining.push_back(approver);
+                }
+            }
+            if remaining.is_empty() {
+                env.storage().persistent().remove(&key);
+            } else {
+                pending.approvals = remaining;
+                env.storage().persistent().set(&key, &pending);
+            }
+        }
+        Ok(())
+    }
+
+    /// Signers whose approval of `action` is currently pending and unexpired.
+    pub fn pending_approvals(env: Env, action: SignerAction) -> Vec<Address> {
+        Self::load_pending(&env, &DataKey::PendingSignerAction(action))
+            .map(|p| p.approvals)
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
     /// The current signer set, or empty when multisig is not enabled.
     pub fn signers(env: Env) -> Vec<Address> {
         env.storage()
@@ -736,6 +826,14 @@ impl DenylistGate {
     // Private helpers
     // -----------------------------------------------------------------------
 
+    /// Extends the instance entry TTL. Soroban does not extend instance TTL
+    /// implicitly on invocation, so every write path calls this explicitly.
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    }
+
     fn contains(signers: &Vec<Address>, address: &Address) -> bool {
         signers.iter().any(|s| s == *address)
     }
@@ -743,6 +841,7 @@ impl DenylistGate {
     /// Requires `caller`'s authorization and membership in the current signer
     /// set; returns that set.
     fn require_signer(env: &Env, caller: &Address) -> Result<SignerSet, Error> {
+        Self::extend_instance_ttl(&env);
         caller.require_auth();
         let signer_set: SignerSet = env
             .storage()
@@ -755,6 +854,16 @@ impl DenylistGate {
         Ok(signer_set)
     }
 
+    /// Loads the pending approval at `key`, treating it as absent once it is
+    /// older than [`APPROVAL_TTL_LEDGERS`].
+    fn load_pending(env: &Env, key: &DataKey) -> Option<PendingApproval> {
+        let pending: PendingApproval = env.storage().persistent().get(key)?;
+        if env.ledger().sequence() > pending.created_ledger.saturating_add(APPROVAL_TTL_LEDGERS) {
+            return None;
+        }
+        Some(pending)
+    }
+
     /// Records `caller`'s approval of `action` and applies it once `threshold`
     /// distinct signers have approved.
     fn approve(
@@ -764,29 +873,31 @@ impl DenylistGate {
         mut signer_set: SignerSet,
     ) -> Result<(), Error> {
         let key = DataKey::PendingSignerAction(action.clone());
-        let mut approvals: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(env));
-        if !Self::contains(&approvals, &caller) {
-            approvals.push_back(caller.clone());
+        let mut pending = Self::load_pending(env, &key).unwrap_or_else(|| PendingApproval {
+            approvals: Vec::new(env),
+            created_ledger: env.ledger().sequence(),
+        });
+        if !Self::contains(&pending.approvals, &caller) {
+            pending.approvals.push_back(caller.clone());
         }
         SignerApproved { signer: caller }.publish(env);
 
         // Only approvals from signers still in the set count towards the threshold.
         let mut valid = 0u32;
-        for approver in approvals.iter() {
+        for approver in pending.approvals.iter() {
             if Self::contains(&signer_set.signers, &approver) {
                 valid += 1;
             }
         }
         if valid < signer_set.threshold {
-            env.storage().instance().set(&key, &approvals);
+            env.storage().persistent().set(&key, &pending);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, APPROVAL_TTL_LEDGERS, APPROVAL_TTL_LEDGERS * 2);
             return Ok(());
         }
 
-        env.storage().instance().remove(&key);
+        env.storage().persistent().remove(&key);
         match action {
             SignerAction::Add(new_signer) => {
                 signer_set.signers.push_back(new_signer.clone());
@@ -822,6 +933,7 @@ impl DenylistGate {
     }
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
         admin.require_auth();
         let stored_admin: Address = env
             .storage()
@@ -835,6 +947,7 @@ impl DenylistGate {
     }
 
     fn require_compliance_authority(env: &Env, caller: &Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
         caller.require_auth();
         let admin: Address = env
             .storage()

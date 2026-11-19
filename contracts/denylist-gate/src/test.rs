@@ -866,3 +866,103 @@ fn test_propose_upgrade_accepts_minimum_delay() {
         Ok(Ok(()))
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// Pending signer approvals (#577) and instance TTL (#582)
+// ---------------------------------------------------------------------------
+
+fn setup_two_of_three(env: &Env) -> (Address, Address, Address, DenylistGateClient<'_>) {
+    let (admin, _contract_id, client) = setup(env);
+    let s1 = Address::generate(env);
+    let s2 = Address::generate(env);
+    let signers = vec![env, admin.clone(), s1.clone(), s2.clone()];
+    client.initialize_multisig(&admin, &signers, &2);
+    (admin, s1, s2, client)
+}
+
+#[test]
+fn test_pending_approvals_not_in_instance_storage() {
+    let env = Env::default();
+    let (admin, _s1, _s2, client) = setup_two_of_three(&env);
+    let new_signer = Address::generate(&env);
+    let action = SignerAction::Add(new_signer.clone());
+
+    client.add_signer(&admin, &new_signer);
+
+    let key = DataKey::PendingSignerAction(action.clone());
+    env.as_contract(&client.address, || {
+        assert!(!env.storage().instance().has(&key));
+        assert!(env.storage().persistent().has(&key));
+    });
+    assert_eq!(client.pending_approvals(&action), vec![&env, admin.clone()]);
+}
+
+#[test]
+fn test_expired_approval_does_not_count_toward_threshold() {
+    let env = Env::default();
+    let (admin, s1, _s2, client) = setup_two_of_three(&env);
+    let new_signer = Address::generate(&env);
+    let action = SignerAction::Add(new_signer.clone());
+
+    client.add_signer(&admin, &new_signer);
+    let start = env.ledger().sequence();
+    env.ledger().set_sequence_number(start + APPROVAL_TTL_LEDGERS + 1);
+
+    assert_eq!(client.pending_approvals(&action).len(), 0);
+
+    // The stale approval from `admin` is ignored, so this is only 1 of 2.
+    client.add_signer(&s1, &new_signer);
+    assert_eq!(client.signers().len(), 3);
+    assert_eq!(client.pending_approvals(&action), vec![&env, s1.clone()]);
+
+    // A fresh second approval applies the action.
+    client.add_signer(&admin, &new_signer);
+    assert_eq!(client.signers().len(), 4);
+    assert_eq!(client.pending_approvals(&action).len(), 0);
+}
+
+#[test]
+fn test_signer_can_revoke_own_approval() {
+    let env = Env::default();
+    let (admin, s1, _s2, client) = setup_two_of_three(&env);
+    let new_signer = Address::generate(&env);
+    let action = SignerAction::Add(new_signer.clone());
+
+    client.add_signer(&admin, &new_signer);
+    client.revoke_approval(&admin, &action);
+    assert_eq!(client.pending_approvals(&action).len(), 0);
+
+    // With the first approval revoked, a second signer only reaches 1 of 2.
+    client.add_signer(&s1, &new_signer);
+    assert_eq!(client.signers().len(), 3);
+}
+
+#[test]
+fn test_revoke_approval_rejects_non_signer() {
+    let env = Env::default();
+    let (_admin, _s1, _s2, client) = setup_two_of_three(&env);
+    let outsider = Address::generate(&env);
+    let action = SignerAction::SetThreshold(1);
+    assert_eq!(
+        client.try_revoke_approval(&outsider, &action),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn test_write_path_extends_instance_ttl() {
+    use soroban_sdk::testutils::storage::Instance as _;
+    let env = Env::default();
+    let (admin, contract_id, client) = setup(&env);
+    let ttl = || env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert_eq!(ttl(), INSTANCE_TTL_EXTEND_TO);
+
+    let start = env.ledger().sequence();
+    env.ledger()
+        .set_sequence_number(start + INSTANCE_TTL_EXTEND_TO - INSTANCE_TTL_THRESHOLD + 10);
+    assert!(ttl() < INSTANCE_TTL_THRESHOLD);
+
+    client.add_to_denylist(&admin, &Address::generate(&env));
+    assert_eq!(ttl(), INSTANCE_TTL_EXTEND_TO);
+}
