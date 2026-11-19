@@ -252,6 +252,16 @@ pub struct AuditLogSet {
     pub audit_log: Address,
 }
 
+/// Emitted when `clear_audit_log` detaches the audit log, so denylist
+/// mutations stop being recorded. `previous` is the audit-log contract that
+/// was detached, if one was configured.
+#[contractevent]
+pub struct AuditLogCleared {
+    #[topic]
+    pub admin: Address,
+    pub previous: Option<Address>,
+}
+
 // ---------------------------------------------------------------------------
 // Errors
 // ---------------------------------------------------------------------------
@@ -401,9 +411,14 @@ impl DenylistGate {
     }
 
     /// Disconnect the audit log so denylist mutations stop calling it. Admin-only.
+    ///
+    /// Emits `AuditLogCleared { admin, previous }` so that silencing the audit
+    /// trail is itself visible off-chain.
     pub fn clear_audit_log(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
+        let previous: Option<Address> = env.storage().instance().get(&DataKey::AuditLog);
         env.storage().instance().remove(&DataKey::AuditLog);
+        AuditLogCleared { admin, previous }.publish(&env);
         Ok(())
     }
 

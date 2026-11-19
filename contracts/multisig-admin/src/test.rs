@@ -3,8 +3,8 @@ extern crate std;
 use super::*;
 use denylist_gate::{DenylistGate, DenylistGateClient};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
-    vec, Address, Bytes, BytesN, Env,
+    testutils::{Address as _, Events as _, Ledger as _},
+    vec, Address, Bytes, BytesN, Env, IntoVal, Map, Symbol, Val,
 };
 
 /// Build an arbitrary 32-byte payload hash for `__check_auth` calls in tests.
@@ -577,6 +577,99 @@ fn test_proposal_ids_are_sequential() {
     assert_eq!(id0, 0u64);
     assert_eq!(id1, 1u64);
     assert_eq!(id2, 2u64);
+}
+
+/// `propose` emits `ProposalCreated` carrying the id, expiry and payload hash.
+#[test]
+fn test_propose_emits_proposal_created_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_signers, contract_id, client) = setup_multisig(&env, 3, 2);
+
+    let payload = Bytes::from_array(&env, &[5u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry);
+
+    let payload_hash: BytesN<32> = env.crypto().sha256(&payload).to_bytes();
+    let events = env.events().all();
+    let (id, topics, data) = events.last().unwrap();
+    assert_eq!(id, contract_id);
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "proposal_created"), proposal_id).into_val(&env)
+    );
+    assert_eq!(
+        data,
+        Map::<Symbol, Val>::from_array(
+            &env,
+            [
+                (Symbol::new(&env, "expiry"), expiry.into_val(&env)),
+                (Symbol::new(&env, "payload_hash"), payload_hash.into_val(&env)),
+            ],
+        )
+        .into_val(&env)
+    );
+}
+
+/// Each `approve` emits `ProposalApproved` with the running approval count.
+#[test]
+fn test_approve_emits_proposal_approved_event_with_progress() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (signers, contract_id, client) = setup_multisig(&env, 3, 2);
+
+    let payload = Bytes::from_array(&env, &[6u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry);
+
+    for (i, expected_approvals) in [(0u32, 1u32), (1, 2)] {
+        let signer = signers.get(i).unwrap();
+        client.approve(&proposal_id, &signer);
+
+        let events = env.events().all();
+        let (id, topics, data) = events.last().unwrap();
+        assert_eq!(id, contract_id);
+        assert_eq!(
+            topics,
+            (Symbol::new(&env, "proposal_approved"), proposal_id, signer).into_val(&env)
+        );
+        assert_eq!(
+            data,
+            Map::<Symbol, Val>::from_array(
+                &env,
+                [(
+                    Symbol::new(&env, "approvals"),
+                    expected_approvals.into_val(&env),
+                )],
+            )
+            .into_val(&env)
+        );
+    }
+}
+
+/// A rejected approval must not emit `ProposalApproved`.
+#[test]
+fn test_rejected_approve_emits_no_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (_signers, _contract_id, client) = setup_multisig(&env, 2, 1);
+
+    let payload = Bytes::from_array(&env, &[7u8; 32]);
+    let expiry = env.ledger().sequence() + 100;
+    let proposal_id = client.propose(&payload, &expiry);
+    let outsider = Address::generate(&env);
+    let events_before = env.events().all().len();
+
+    let result = client.try_approve(&proposal_id, &outsider);
+    assert_eq!(result, Err(Ok(Error::NotASigner)));
+    let events = env.events().all();
+    assert!(events.len() <= events_before);
+    if let Some((_, topics, _)) = events.last() {
+        assert_eq!(
+            topics,
+            (Symbol::new(&env, "proposal_created"), proposal_id).into_val(&env)
+        );
+    }
 }
 
 /// Approving an unknown proposal returns ProposalNotFound.

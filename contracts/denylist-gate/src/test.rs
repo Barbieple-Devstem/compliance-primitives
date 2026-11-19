@@ -880,6 +880,59 @@ fn test_remove_multiple_from_denylist_removes_all_without_audit_log_noise() {
 }
 
 #[test]
+fn test_clear_audit_log_emits_audit_log_cleared_event() {
+    let env = Env::default();
+    let (admin, contract_id, client) = setup(&env);
+    let audit_log = Address::generate(&env);
+    client.set_audit_log(&admin, &audit_log);
+
+    client.clear_audit_log(&admin);
+
+    assert_eq!(client.get_audit_log(), None);
+    let events = env.events().all();
+    let (id, topics, data) = events.last().unwrap();
+    assert_eq!(id, contract_id);
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "audit_log_cleared"), admin.clone()).into_val(&env)
+    );
+    assert_eq!(
+        data,
+        Map::<Symbol, Val>::from_array(
+            &env,
+            [(Symbol::new(&env, "previous"), Some(audit_log).into_val(&env))],
+        )
+        .into_val(&env)
+    );
+}
+
+#[test]
+fn test_clear_audit_log_without_audit_log_emits_none_previous() {
+    let env = Env::default();
+    let (admin, _contract_id, client) = setup(&env);
+
+    client.clear_audit_log(&admin);
+
+    let events = env.events().all();
+    let (_, topics, data) = events.last().unwrap();
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "audit_log_cleared"), admin).into_val(&env)
+    );
+    assert_eq!(
+        data,
+        Map::<Symbol, Val>::from_array(
+            &env,
+            [(
+                Symbol::new(&env, "previous"),
+                Option::<Address>::None.into_val(&env),
+            )],
+        )
+        .into_val(&env)
+    );
+}
+
+#[test]
 fn test_propose_upgrade_rejects_delay_below_minimum() {
     let env = Env::default();
     let (admin, _contract_id, client) = setup(&env);

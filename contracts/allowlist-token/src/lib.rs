@@ -156,6 +156,36 @@ pub struct UpgradeCommitted {
     pub new_wasm: BytesN<32>,
 }
 
+/// Emitted when `set_compliance_officer` assigns the compliance-officer role.
+/// `previous` is the officer being replaced, if one was assigned.
+#[contractevent]
+pub struct ComplianceOfficerSet {
+    #[topic]
+    pub admin: Address,
+    #[topic]
+    pub officer: Address,
+    pub previous: Option<Address>,
+}
+
+/// Emitted when `revoke_compliance_officer` clears the compliance-officer role.
+/// `previous` is the officer that was revoked, if one was assigned.
+#[contractevent]
+pub struct ComplianceOfficerRevoked {
+    #[topic]
+    pub admin: Address,
+    pub previous: Option<Address>,
+}
+
+/// Emitted when `set_delegated_admin_key` registers or rotates the ed25519
+/// key that may authorize delegated admin actions.
+#[contractevent]
+pub struct DelegatedAdminKeySet {
+    #[topic]
+    pub admin: Address,
+    pub previous: Option<BytesN<32>>,
+    pub pubkey: BytesN<32>,
+}
+
 #[contractevent]
 pub struct Paused {
     #[topic]
@@ -254,15 +284,27 @@ impl AllowlistToken {
     /// actions without the admin account itself needing to submit the
     /// transaction. The direct-auth path remains unchanged and still uses
     /// `admin.require_auth()`. Admin-only.
+    ///
+    /// Emits `DelegatedAdminKeySet { admin, previous, pubkey }`.
     pub fn set_delegated_admin_key(
         env: Env,
         admin: Address,
         pubkey: BytesN<32>,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
+        let previous: Option<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DelegatedAdminPubKey);
         env.storage()
             .instance()
             .set(&DataKey::DelegatedAdminPubKey, &pubkey);
+        DelegatedAdminKeySet {
+            admin,
+            previous,
+            pubkey,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -405,11 +447,14 @@ impl AllowlistToken {
 
     /// Remove every address from the allowlist. Admin or compliance officer;
     /// each address emits an individual `AllowRemove` event.
+    ///
+    /// Returns `Err(ContractPaused)` if the contract is currently paused.
     pub fn remove_multiple_from_allowlist(
         env: Env,
         admin: Address,
         addresses: Vec<Address>,
     ) -> Result<(), Error> {
+        Self::reject_if_paused(&env)?;
         Self::require_compliance_authority(&env, &admin)?;
         if addresses.len() > MAX_BATCH_SIZE {
             return Err(Error::BatchTooLarge);
@@ -425,18 +470,37 @@ impl AllowlistToken {
     }
 
     /// Assign the compliance-officer role. Admin-only.
+    ///
+    /// Emits `ComplianceOfficerSet { admin, officer, previous }`.
     pub fn set_compliance_officer(env: Env, admin: Address, officer: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
+        let previous: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ComplianceOfficer);
         env.storage()
             .instance()
             .set(&DataKey::ComplianceOfficer, &officer);
+        ComplianceOfficerSet {
+            admin,
+            officer,
+            previous,
+        }
+        .publish(&env);
         Ok(())
     }
 
     /// Revoke the compliance-officer role. Admin-only.
+    ///
+    /// Emits `ComplianceOfficerRevoked { admin, previous }`.
     pub fn revoke_compliance_officer(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
+        let previous: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ComplianceOfficer);
         env.storage().instance().remove(&DataKey::ComplianceOfficer);
+        ComplianceOfficerRevoked { admin, previous }.publish(&env);
         Ok(())
     }
 
@@ -646,8 +710,9 @@ impl AllowlistToken {
     ///
     /// While paused:
     /// - `transfer` returns `Err(ContractPaused)`.
-    /// - `add_to_allowlist`, `add_to_allowlist_delegated`, and
-    ///   `remove_from_allowlist` return `Err(ContractPaused)`.
+    /// - `add_to_allowlist`, `add_to_allowlist_delegated`,
+    ///   `remove_from_allowlist`, and `remove_multiple_from_allowlist` return
+    ///   `Err(ContractPaused)`.
     ///
     /// The following are deliberately **not** blocked by pause so that an
     /// operator can always recover from an incident:

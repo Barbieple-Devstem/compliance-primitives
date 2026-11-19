@@ -203,6 +203,34 @@ pub struct Upgraded {
     pub new_wasm_hash: BytesN<32>,
 }
 
+/// Emitted when `propose` creates a new proposal, so off-chain signers can
+/// discover it without polling storage.
+///
+/// topics : [Symbol("proposal_created"), u64(id)]
+/// data   : { expiry: u32, payload_hash: BytesN<32> }
+#[contractevent]
+pub struct ProposalCreated {
+    #[topic]
+    pub id: u64,
+    pub expiry: u32,
+    /// SHA-256 of the proposal payload.
+    pub payload_hash: BytesN<32>,
+}
+
+/// Emitted when `approve` records a signer's approval on a proposal.
+///
+/// topics : [Symbol("proposal_approved"), u64(id), Address(signer)]
+/// data   : { approvals: u32 }
+#[contractevent]
+pub struct ProposalApproved {
+    #[topic]
+    pub id: u64,
+    #[topic]
+    pub signer: Address,
+    /// Total number of approvals recorded on the proposal after this one.
+    pub approvals: u32,
+}
+
 // ---------------------------------------------------------------------------
 // Storage
 // ---------------------------------------------------------------------------
@@ -506,6 +534,8 @@ impl MultisigAdmin {
 
     /// Create a new proposal with the given payload. Returns the proposal ID.
     /// The proposal expires at `expiry_ledger`.
+    ///
+    /// Emits `ProposalCreated { id, expiry, payload_hash }`.
     pub fn propose(
         env: Env,
         payload: soroban_sdk::Bytes,
@@ -528,6 +558,7 @@ impl MultisigAdmin {
             return Err(Error::NotInitialized);
         }
 
+        let payload_hash: BytesN<32> = env.crypto().sha256(&payload).to_bytes();
         let proposal = Proposal {
             payload,
             expiry: expiry_ledger,
@@ -542,12 +573,21 @@ impl MultisigAdmin {
             .set(&DataKey::NextProposalId, &(proposal_id + 1));
         extend_instance_ttl(&env);
 
+        ProposalCreated {
+            id: proposal_id,
+            expiry: expiry_ledger,
+            payload_hash,
+        }
+        .publish(&env);
+
         Ok(proposal_id)
     }
 
     /// Approve a proposal. The approver must be a valid signer. A signer can
     /// only approve once. Returns true if the proposal now has enough approvals
     /// to execute.
+    ///
+    /// Emits `ProposalApproved { id, signer, approvals }`.
     pub fn approve(env: Env, proposal_id: u64, approver: Address) -> Result<bool, Error> {
         compliance_pausable::require_not_paused_or(&env, Error::ContractPaused)?;
         // The approver must prove they authorized this call — prevents any
@@ -590,11 +630,18 @@ impl MultisigAdmin {
             }
         }
 
-        proposal.approvals.push_back(approver);
+        proposal.approvals.push_back(approver.clone());
         env.storage()
             .instance()
             .set(&DataKey::Proposal(proposal_id), &proposal);
         extend_instance_ttl(&env);
+
+        ProposalApproved {
+            id: proposal_id,
+            signer: approver,
+            approvals: proposal.approvals.len(),
+        }
+        .publish(&env);
 
         let threshold: u32 = env
             .storage()
