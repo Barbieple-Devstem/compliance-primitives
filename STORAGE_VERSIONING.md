@@ -124,6 +124,34 @@ Issuers should read the target version's `UPGRADE.md` before calling
 first, per the existing [testing guidance in
 `UPGRADE.md`](./contracts/jurisdiction-flag/UPGRADE.md#testing-the-upgrade-path).
 
+## Instance storage TTL policy
+
+Soroban does **not** extend a contract's instance-storage TTL just because the
+contract is invoked. Instance TTL only grows through an explicit
+`env.storage().instance().extend_ttl(...)` call or an external
+`ExtendFootprintTTL` operation. If the instance entry is archived, the admin
+key, pause flag, token address and signer set become unreadable and every call,
+including `check()` / `is_allowed()` from consuming contracts, fails until the
+entry is restored.
+
+Every contract in this workspace therefore follows the same policy:
+
+| Constant                  | Value       | Approx. wall-clock time |
+|---------------------------|-------------|-------------------------|
+| `INSTANCE_TTL_THRESHOLD`  | `120_960`   | ~7 days                 |
+| `INSTANCE_TTL_EXTEND_TO`  | `1_555_200` | ~90 days                |
+
+- Every write path (initialization, admin/issuer/officer-gated mutations,
+  admin hand-over) calls `extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO)`.
+- The hot read paths used by consuming contracts (`denylist-gate::check`,
+  `allowlist-token::is_allowed` / `transfer`,
+  `jurisdiction-flag::is_permitted_jurisdiction`) also extend the instance TTL,
+  so a contract that is only ever read from stays live.
+- Pending multisig approvals in `denylist-gate` live in **persistent** storage
+  (`DataKey::PendingSignerAction`), not instance storage, so abandoned
+  proposals do not grow the instance entry. They stop counting after
+  `APPROVAL_TTL_LEDGERS` (~7 days) and can be withdrawn with `revoke_approval`.
+
 ## For contributors
 
 If your change touches a `DataKey` enum or any other `#[contracttype]` used

@@ -1171,3 +1171,21 @@ fn test_add_jurisdiction_at_boundary_accepts_up_to_cap() {
         super::MAX_CODES_PER_ADDRESS
     );
 }
+
+
+#[test]
+fn test_write_path_extends_instance_ttl() {
+    use soroban_sdk::testutils::storage::Instance as _;
+    let env = Env::default();
+    let (issuer, contract_id, client) = setup(&env);
+    let ttl = || env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert_eq!(ttl(), INSTANCE_TTL_EXTEND_TO);
+
+    let start = env.ledger().sequence();
+    env.ledger()
+        .set_sequence_number(start + INSTANCE_TTL_EXTEND_TO - INSTANCE_TTL_THRESHOLD + 10);
+    assert!(ttl() < INSTANCE_TTL_THRESHOLD);
+
+    client.set_jurisdiction(&issuer, &Address::generate(&env), &soroban_sdk::String::from_str(&env, "US"));
+    assert_eq!(ttl(), INSTANCE_TTL_EXTEND_TO);
+}

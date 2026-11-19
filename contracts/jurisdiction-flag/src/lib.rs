@@ -48,6 +48,13 @@ const TTL_EXTEND_TO: u32 = 1_555_200;
 /// exhaustion.
 pub const MAX_BATCH_SIZE: u32 = 100;
 
+/// Instance-storage TTL policy: whenever the remaining instance TTL drops
+/// below [`INSTANCE_TTL_THRESHOLD`], it is bumped back up to
+/// [`INSTANCE_TTL_EXTEND_TO`]. Matches `compliance-aggregator`.
+pub const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
+/// Target instance TTL after an extension.
+pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
+
 /// Maximum number of jurisdiction codes that can be attached to a single
 /// address. Enforced in `add_jurisdiction` to prevent a compromised or buggy
 /// officer key from attaching so many codes that every later
@@ -190,6 +197,7 @@ impl JurisdictionFlag {
     /// - [`Error::AlreadyInitialized`] if the contract has already been
     ///   initialized. The existing issuer is left unchanged.
     pub fn initialize(env: Env, issuer: Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
         if env.storage().instance().has(&DataKey::Issuer) {
             return Err(Error::AlreadyInitialized);
         }
@@ -257,6 +265,7 @@ impl JurisdictionFlag {
     /// passed to `propose_issuer`; it becomes the issuer and the proposal is
     /// cleared.
     pub fn accept_issuer(env: Env, new_issuer: Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
         new_issuer.require_auth();
         let pending: Address = env
             .storage()
@@ -584,6 +593,7 @@ impl JurisdictionFlag {
         address: Address,
         allowed_codes: Vec<String>,
     ) -> Result<bool, Error> {
+        Self::extend_instance_ttl(&env);
         if allowed_codes.is_empty() {
             return Err(Error::EmptyAllowedCodes);
         }
@@ -615,6 +625,14 @@ impl JurisdictionFlag {
     // Private helpers
     // -----------------------------------------------------------------------
 
+
+    /// Extends the instance entry TTL. Soroban does not extend instance TTL
+    /// implicitly on invocation, so every write path calls this explicitly.
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    }
     fn reject_if_paused(env: &Env) -> Result<(), Error> {
         if env
             .storage()
@@ -661,6 +679,7 @@ impl JurisdictionFlag {
     /// yet, or [`Error::NotAuthorized`] if `issuer` does not match the stored
     /// issuer address.
     fn require_issuer(env: &Env, issuer: &Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
         issuer.require_auth();
         let stored_issuer: Address = env
             .storage()
@@ -699,6 +718,7 @@ impl JurisdictionFlag {
     /// or [`Error::NotAuthorized`] if `caller` is neither the issuer nor the
     /// compliance officer.
     fn require_compliance_authority(env: &Env, caller: &Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
         caller.require_auth();
         let stored_issuer: Address = env
             .storage()
