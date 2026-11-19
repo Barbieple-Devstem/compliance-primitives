@@ -2,7 +2,7 @@ use super::*;
 use ed25519_dalek::SigningKey;
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
 use soroban_sdk::testutils::ed25519::Sign;
-use soroban_sdk::{contract, contractimpl, symbol_short, vec, Bytes, BytesN, Env, IntoVal, Map, Symbol, Val, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, vec, Bytes, BytesN, Env, IntoVal, Map, Symbol, Val, Vec};
 use std::path::{Path, PathBuf};
 
 // ─── MockToken ───────────────────────────────────────────────────────────────
@@ -12,10 +12,38 @@ use std::path::{Path, PathBuf};
 #[contract]
 struct MockToken;
 
+#[contracttype]
+enum MockKey {
+    Balance(Address),
+}
+
 #[contractimpl]
 impl MockToken {
+    /// Test-only: credits `amount` to `to` without any auth check.
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let current = Self::balance(env.clone(), to.clone());
+        env.storage()
+            .instance()
+            .set(&MockKey::Balance(to), &(current + amount));
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&MockKey::Balance(id))
+            .unwrap_or(0)
+    }
+
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
         from.require_auth();
+        let from_balance = Self::balance(env.clone(), from.clone());
+        let to_balance = Self::balance(env.clone(), to.clone());
+        env.storage()
+            .instance()
+            .set(&MockKey::Balance(from.clone()), &(from_balance - amount));
+        env.storage()
+            .instance()
+            .set(&MockKey::Balance(to.clone()), &(to_balance + amount));
         env.storage().instance().set(&Symbol::new(&env, "last"), &(from, to, amount));
     }
 
@@ -1702,6 +1730,84 @@ fn build_four_leaf_tree(
         vec![env, l2.clone(), n01.clone()],
     ];
     (root, holders, proofs)
+}
+
+#[test]
+fn test_max_balance_limits_recipient_balance() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let token = MockTokenClient::new(&env, &token_id);
+    let sender = Address::generate(&env);
+    let receiver = Address::generate(&env);
+    client.add_multiple_to_allowlist(&admin, &vec![&env, sender.clone(), receiver.clone()], &None);
+    token.mint(&sender, &500);
+    token.mint(&receiver, &80);
+
+    client.set_global_max_balance(&admin, &Some(100));
+    assert_eq!(client.get_global_max_balance(), Some(100));
+
+    // 80 + 20 = 100 is at the limit, so it is allowed.
+    assert!(client.transfer(&sender, &receiver, &20));
+
+    // 100 + 1 exceeds the limit.
+    assert_eq!(
+        client.try_transfer(&sender, &receiver, &1),
+        Err(Ok(Error::MaxBalanceExceeded))
+    );
+    assert_eq!(token.balance(&receiver), 100);
+}
+
+#[test]
+fn test_per_address_max_balance_is_stricter_when_both_apply() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let token = MockTokenClient::new(&env, &token_id);
+    let sender = Address::generate(&env);
+    let receiver = Address::generate(&env);
+    client.add_multiple_to_allowlist(&admin, &vec![&env, sender.clone(), receiver.clone()], &None);
+    token.mint(&sender, &500);
+
+    client.set_global_max_balance(&admin, &Some(100));
+    client.set_address_max_balance(&admin, &receiver, &Some(50));
+    assert_eq!(client.get_address_max_balance(&receiver), Some(50));
+
+    // The per-address limit (50) is stricter than the global one (100).
+    assert_eq!(
+        client.try_transfer(&sender, &receiver, &51),
+        Err(Ok(Error::MaxBalanceExceeded))
+    );
+    assert!(client.transfer(&sender, &receiver, &50));
+
+    // Clearing the per-address limit leaves only the global limit.
+    client.set_address_max_balance(&admin, &receiver, &None);
+    assert_eq!(client.get_address_max_balance(&receiver), None);
+    assert!(client.transfer(&sender, &receiver, &50));
+    assert_eq!(token.balance(&receiver), 100);
+}
+
+#[test]
+fn test_max_balance_setters_are_admin_only_and_reject_negative_limits() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let attacker = Address::generate(&env);
+    let holder = Address::generate(&env);
+
+    assert_eq!(
+        client.try_set_global_max_balance(&attacker, &Some(10)),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        client.try_set_address_max_balance(&attacker, &holder, &Some(10)),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        client.try_set_global_max_balance(&admin, &Some(-1)),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        client.try_set_address_max_balance(&admin, &holder, &Some(-1)),
+        Err(Ok(Error::InvalidInput))
+    );
 }
 
 #[test]

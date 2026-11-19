@@ -122,6 +122,10 @@ enum DataKey {
     AllowlistCount,
     /// Merkle root of the proof-based allowlist. Instance storage.
     AllowlistRoot,
+    /// Global maximum balance any single address may hold. Instance storage.
+    GlobalMaxBalance,
+    /// Per-address maximum balance. Persistent storage.
+    MaxBalance(Address),
 }
 
 #[contracttype]
@@ -246,6 +250,17 @@ pub struct DelegatedAdminKeySet {
     pub pubkey: BytesN<32>,
 }
 
+/// Emitted when a max-balance limit changes. `address` is `None` for the
+/// global limit and `Some(holder)` for a per-address limit. `limit` is `None`
+/// when the limit is removed.
+#[contractevent]
+pub struct MaxBalanceSet {
+    #[topic]
+    pub admin: Address,
+    pub address: Option<Address>,
+    pub limit: Option<i128>,
+}
+
 /// Emitted when `set_allowlist_root` publishes a new proof-mode allowlist root.
 #[contractevent]
 pub struct AllowlistRootSet {
@@ -312,6 +327,9 @@ pub enum Error {
     /// `clawback` was called against an address that is not frozen while
     /// `clawback_requires_freeze` is enabled.
     ClawbackRequiresFreeze = 15,
+    /// A transfer would leave the recipient above the global or per-address
+    /// maximum balance.
+    MaxBalanceExceeded = 16,
 }
 
 #[contract]
@@ -904,6 +922,74 @@ impl AllowlistToken {
             .unwrap_or(0)
     }
 
+    /// Set or clear the global maximum balance any single address may hold.
+    /// Admin-only. `None` removes the limit. Negative limits are rejected
+    /// with `InvalidInput`.
+    ///
+    /// Enforced on the recipient of `transfer` and `transfer_with_proof`
+    /// (see `MaxBalanceExceeded`). Emits `MaxBalanceSet`.
+    pub fn set_global_max_balance(env: Env, admin: Address, limit: Option<i128>) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        Self::validate_limit(limit)?;
+        match limit {
+            Some(limit) => env
+                .storage()
+                .instance()
+                .set(&DataKey::GlobalMaxBalance, &limit),
+            None => env.storage().instance().remove(&DataKey::GlobalMaxBalance),
+        }
+        MaxBalanceSet {
+            admin,
+            address: None,
+            limit,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Set or clear the maximum balance for one address. Admin-only. `None`
+    /// removes the per-address limit. Negative limits are rejected with
+    /// `InvalidInput`.
+    ///
+    /// When both a global and a per-address limit apply, the stricter one is
+    /// enforced. Emits `MaxBalanceSet`.
+    pub fn set_address_max_balance(
+        env: Env,
+        admin: Address,
+        address: Address,
+        limit: Option<i128>,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        Self::validate_limit(limit)?;
+        let key = DataKey::MaxBalance(address.clone());
+        match limit {
+            Some(limit) => {
+                env.storage().persistent().set(&key, &limit);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, ALLOWED_TTL_THRESHOLD, ALLOWED_TTL_EXTEND_TO);
+            }
+            None => env.storage().persistent().remove(&key),
+        }
+        MaxBalanceSet {
+            admin,
+            address: Some(address),
+            limit,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Returns the global maximum balance, if one is set.
+    pub fn get_global_max_balance(env: Env) -> Option<i128> {
+        env.storage().instance().get(&DataKey::GlobalMaxBalance)
+    }
+
+    /// Returns the per-address maximum balance for `address`, if one is set.
+    pub fn get_address_max_balance(env: Env, address: Address) -> Option<i128> {
+        env.storage().persistent().get(&DataKey::MaxBalance(address))
+    }
+
     /// Publish the Merkle root of the proof-based allowlist. Admin-only.
     ///
     /// Proof mode lets an issuer authorize a large holder set with one
@@ -973,6 +1059,7 @@ impl AllowlistToken {
             Blocked { from, to, amount }.publish(&env);
             return Ok(false);
         }
+        Self::enforce_max_balance(&env, &to, amount)?;
         let token_address: Address = env
             .storage()
             .instance()
@@ -1068,6 +1155,7 @@ impl AllowlistToken {
             Blocked { from, to, amount }.publish(&env);
             return Ok(false);
         }
+        Self::enforce_max_balance(&env, &to, amount)?;
 
         let token_address: Address = env
             .storage()
@@ -1162,6 +1250,40 @@ impl AllowlistToken {
         env.storage()
             .instance()
             .set(&DataKey::AllowlistCount, &updated);
+    }
+
+    fn validate_limit(limit: Option<i128>) -> Result<(), Error> {
+        match limit {
+            Some(value) if value < 0 => Err(Error::InvalidInput),
+            _ => Ok(()),
+        }
+    }
+
+    /// Rejects a transfer that would leave `to` above its effective maximum
+    /// balance: the stricter of the global limit and `to`'s own limit, using
+    /// whichever are set. Does nothing when neither is set.
+    fn enforce_max_balance(env: &Env, to: &Address, amount: i128) -> Result<(), Error> {
+        let global: Option<i128> = env.storage().instance().get(&DataKey::GlobalMaxBalance);
+        let per_address: Option<i128> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MaxBalance(to.clone()));
+        let limit = match (global, per_address) {
+            (None, None) => return Ok(()),
+            (Some(limit), None) | (None, Some(limit)) => limit,
+            (Some(global), Some(own)) => global.min(own),
+        };
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(Error::NotInitialized)?;
+        let current = token::Client::new(env, &token_address).balance(to);
+        let projected = current.checked_add(amount).ok_or(Error::InvalidInput)?;
+        if projected > limit {
+            return Err(Error::MaxBalanceExceeded);
+        }
+        Ok(())
     }
 
     /// Rebuilds the root from `address`'s leaf and the supplied siblings and
