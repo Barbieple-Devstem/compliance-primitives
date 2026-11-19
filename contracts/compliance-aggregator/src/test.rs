@@ -145,6 +145,30 @@ fn test_double_initialize_fails() {
 }
 
 #[test]
+fn test_get_admin_returns_initialized_admin() {
+    let env = Env::default();
+    let (_, _, _, _, admin, _, client) = setup_all(&env);
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_get_admin_before_initialize_fails() {
+    let env = Env::default();
+    let id = env.register(ComplianceAggregator, ());
+    let client = ComplianceAggregatorClient::new(&env, &id);
+    assert_eq!(client.try_get_admin(), Err(Ok(Error::NotInitialized)));
+}
+
+#[test]
+fn test_get_admin_reflects_set_admin() {
+    let env = Env::default();
+    let (_, _, _, _, admin, _, client) = setup_all(&env);
+    let new_admin = Address::generate(&env);
+    client.set_admin(&admin, &new_admin);
+    assert_eq!(client.get_admin(), new_admin);
+}
+
+#[test]
 fn test_set_admin_succeeds() {
     let env = Env::default();
     let (_, _, _, _, admin, _, client) = setup_all(&env);

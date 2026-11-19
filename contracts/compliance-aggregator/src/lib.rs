@@ -23,7 +23,7 @@
 //!   `set_circuit_breaker`, `set_admin`, `pause`, `unpause`, and `upgrade`.
 //!   Every mutation requires the admin's auth.
 //! - **Off-chain tooling and auditors** call the read-only views
-//!   (`get_config`, `get_checks_summary`, `is_paused`) and consume the
+//!   (`get_admin`, `get_config`, `get_checks_summary`, `is_paused`) and consume the
 //!   configuration events to reconstruct which checks were registered when.
 //!
 //! ## Composition
@@ -505,6 +505,16 @@ impl ComplianceAggregator {
     // -----------------------------------------------------------------------
     // Read helpers
     // -----------------------------------------------------------------------
+
+    /// Returns the configured admin address.
+    ///
+    /// Returns `Error::NotInitialized` if `initialize` has not been called.
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
 
     /// Returns the currently registered `denylist-gate` address, if any.
     pub fn denylist_gate(env: Env) -> Option<Address> {
