@@ -145,6 +145,30 @@ fn test_double_initialize_fails() {
 }
 
 #[test]
+fn test_get_admin_returns_initialized_admin() {
+    let env = Env::default();
+    let (_, _, _, _, admin, _, client) = setup_all(&env);
+    assert_eq!(client.get_admin(), admin);
+}
+
+#[test]
+fn test_get_admin_before_initialize_fails() {
+    let env = Env::default();
+    let id = env.register(ComplianceAggregator, ());
+    let client = ComplianceAggregatorClient::new(&env, &id);
+    assert_eq!(client.try_get_admin(), Err(Ok(Error::NotInitialized)));
+}
+
+#[test]
+fn test_get_admin_reflects_set_admin() {
+    let env = Env::default();
+    let (_, _, _, _, admin, _, client) = setup_all(&env);
+    let new_admin = Address::generate(&env);
+    client.set_admin(&admin, &new_admin);
+    assert_eq!(client.get_admin(), new_admin);
+}
+
+#[test]
 fn test_set_admin_succeeds() {
     let env = Env::default();
     let (_, _, _, _, admin, _, client) = setup_all(&env);
@@ -798,6 +822,64 @@ fn bench_batch_vs_individual_loop() {
         batch_cpu <= individual_cpu * 4,
         "Batch path CPU ({batch_cpu}) exceeds 4× the individual loop ({individual_cpu})"
     );
+}
+
+/// Sweeps representative batch sizes and prints the measured budget of
+/// `check_address` × N vs. one `check_all` call for each, feeding the
+/// "Choosing `check_address` vs. `check_all`" guidance in the module docs.
+#[test]
+fn bench_check_address_vs_check_all_batch_sizes() {
+    const BATCH_SIZES: [u32; 5] = [1, 2, 5, 10, 25];
+
+    std::println!(
+        "\n=== check_address vs check_all by batch size ===\n\
+         {:>5} | {:>14} {:>12} | {:>14} {:>12} | {:>8}",
+        "N", "addr×N cpu", "addr×N mem", "check_all cpu", "check_all mem", "cpu B/A"
+    );
+
+    for n in BATCH_SIZES {
+        // Fresh env per size so cached instances don't skew later rows.
+        let env = Env::default();
+        let (_, _, flag_issuer, flag_id, _, _, client) = setup_all(&env);
+
+        let mut addresses: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+        for _ in 0..n {
+            let a = Address::generate(&env);
+            set_jurisdiction(&env, &flag_id, &flag_issuer, &a, "US");
+            addresses.push_back(a);
+        }
+        let allowed = us_vec(&env);
+
+        env.cost_estimate().budget().reset_unlimited();
+        for addr in addresses.iter() {
+            let (passed, _) = client.check_address(&addr, &allowed);
+            assert!(passed);
+        }
+        let single_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+        let single_mem = env.cost_estimate().budget().memory_bytes_cost();
+
+        env.cost_estimate().budget().reset_unlimited();
+        let results = client.check_all(&addresses, &allowed);
+        let batch_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+        let batch_mem = env.cost_estimate().budget().memory_bytes_cost();
+        assert_eq!(results.len(), n);
+        assert!(results.iter().all(|r| r.all_passed));
+
+        std::println!(
+            "{n:>5} | {single_cpu:>14} {single_mem:>12} | {batch_cpu:>14} {batch_mem:>12} | {:>7.2}×",
+            batch_cpu as f64 / single_cpu as f64,
+        );
+
+        // Both paths make the same 2 × N downstream calls; check_all only
+        // removes per-invocation overhead, so it must never cost more than
+        // the equivalent check_address loop by a wide margin (same 4×
+        // tolerance as `bench_batch_vs_individual_loop`).
+        assert!(
+            batch_cpu <= single_cpu * 4,
+            "check_all CPU ({batch_cpu}) exceeds 4× check_address × {n} ({single_cpu})"
+        );
+    }
+    std::println!("================================================");
 }
 
 // ---------------------------------------------------------------------------

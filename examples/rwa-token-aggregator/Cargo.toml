@@ -1,0 +1,25 @@
+[package]
+name = "rwa-token-aggregator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reference RWA token whose transfer path calls only compliance-aggregator, composing denylist-gate, jurisdiction-flag and circuit-breaker."
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+compliance-aggregator = { path = "../../contracts/compliance-aggregator", features = ["testutils"] }
+circuit-breaker = { path = "../../contracts/circuit-breaker", features = ["testutils"] }
+denylist-gate = { path = "../../contracts/denylist-gate", features = ["testutils"] }
+jurisdiction-flag = { path = "../../contracts/jurisdiction-flag", features = ["testutils"] }
+
+[features]
+testutils = ["soroban-sdk/testutils"]

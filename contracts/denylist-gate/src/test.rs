@@ -416,6 +416,46 @@ fn test_remove_multiple_from_denylist_over_batch_limit_rejected() {
 }
 
 #[test]
+fn test_is_paused_tracks_pause_and_unpause() {
+    let env = Env::default();
+    let (admin, _, client) = setup(&env);
+    assert!(!client.is_paused());
+
+    client.pause(&admin);
+    assert!(client.is_paused());
+
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_is_paused_false_before_initialize() {
+    let env = Env::default();
+    let contract_id = env.register(DenylistGate, ());
+    let client = DenylistGateClient::new(&env, &contract_id);
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn test_is_paused_matches_mutation_rejection() {
+    let env = Env::default();
+    let (admin, _, client) = setup(&env);
+    let target = Address::generate(&env);
+
+    client.pause(&admin);
+    assert!(client.is_paused());
+    assert_eq!(
+        client.try_add_to_denylist(&admin, &target),
+        Err(Ok(Error::ContractPaused))
+    );
+
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+    client.add_to_denylist(&admin, &target);
+    assert!(!client.check(&target));
+}
+
+#[test]
 fn test_double_initialize_fails() {
     let env = Env::default();
     let (admin, _contract_id, client) = setup(&env);
@@ -840,6 +880,59 @@ fn test_remove_multiple_from_denylist_removes_all_without_audit_log_noise() {
 }
 
 #[test]
+fn test_clear_audit_log_emits_audit_log_cleared_event() {
+    let env = Env::default();
+    let (admin, contract_id, client) = setup(&env);
+    let audit_log = Address::generate(&env);
+    client.set_audit_log(&admin, &audit_log);
+
+    client.clear_audit_log(&admin);
+
+    assert_eq!(client.get_audit_log(), None);
+    let events = env.events().all();
+    let (id, topics, data) = events.last().unwrap();
+    assert_eq!(id, contract_id);
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "audit_log_cleared"), admin.clone()).into_val(&env)
+    );
+    assert_eq!(
+        data,
+        Map::<Symbol, Val>::from_array(
+            &env,
+            [(Symbol::new(&env, "previous"), Some(audit_log).into_val(&env))],
+        )
+        .into_val(&env)
+    );
+}
+
+#[test]
+fn test_clear_audit_log_without_audit_log_emits_none_previous() {
+    let env = Env::default();
+    let (admin, _contract_id, client) = setup(&env);
+
+    client.clear_audit_log(&admin);
+
+    let events = env.events().all();
+    let (_, topics, data) = events.last().unwrap();
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "audit_log_cleared"), admin).into_val(&env)
+    );
+    assert_eq!(
+        data,
+        Map::<Symbol, Val>::from_array(
+            &env,
+            [(
+                Symbol::new(&env, "previous"),
+                Option::<Address>::None.into_val(&env),
+            )],
+        )
+        .into_val(&env)
+    );
+}
+
+#[test]
 fn test_propose_upgrade_rejects_delay_below_minimum() {
     let env = Env::default();
     let (admin, _contract_id, client) = setup(&env);
@@ -865,4 +958,104 @@ fn test_propose_upgrade_accepts_minimum_delay() {
         client.try_propose_upgrade(&admin, &wasm_hash, &MIN_UPGRADE_DELAY_LEDGERS),
         Ok(Ok(()))
     );
+}
+
+
+// ---------------------------------------------------------------------------
+// Pending signer approvals (#577) and instance TTL (#582)
+// ---------------------------------------------------------------------------
+
+fn setup_two_of_three(env: &Env) -> (Address, Address, Address, DenylistGateClient<'_>) {
+    let (admin, _contract_id, client) = setup(env);
+    let s1 = Address::generate(env);
+    let s2 = Address::generate(env);
+    let signers = vec![env, admin.clone(), s1.clone(), s2.clone()];
+    client.initialize_multisig(&admin, &signers, &2);
+    (admin, s1, s2, client)
+}
+
+#[test]
+fn test_pending_approvals_not_in_instance_storage() {
+    let env = Env::default();
+    let (admin, _s1, _s2, client) = setup_two_of_three(&env);
+    let new_signer = Address::generate(&env);
+    let action = SignerAction::Add(new_signer.clone());
+
+    client.add_signer(&admin, &new_signer);
+
+    let key = DataKey::PendingSignerAction(action.clone());
+    env.as_contract(&client.address, || {
+        assert!(!env.storage().instance().has(&key));
+        assert!(env.storage().persistent().has(&key));
+    });
+    assert_eq!(client.pending_approvals(&action), vec![&env, admin.clone()]);
+}
+
+#[test]
+fn test_expired_approval_does_not_count_toward_threshold() {
+    let env = Env::default();
+    let (admin, s1, _s2, client) = setup_two_of_three(&env);
+    let new_signer = Address::generate(&env);
+    let action = SignerAction::Add(new_signer.clone());
+
+    client.add_signer(&admin, &new_signer);
+    let start = env.ledger().sequence();
+    env.ledger().set_sequence_number(start + APPROVAL_TTL_LEDGERS + 1);
+
+    assert_eq!(client.pending_approvals(&action).len(), 0);
+
+    // The stale approval from `admin` is ignored, so this is only 1 of 2.
+    client.add_signer(&s1, &new_signer);
+    assert_eq!(client.signers().len(), 3);
+    assert_eq!(client.pending_approvals(&action), vec![&env, s1.clone()]);
+
+    // A fresh second approval applies the action.
+    client.add_signer(&admin, &new_signer);
+    assert_eq!(client.signers().len(), 4);
+    assert_eq!(client.pending_approvals(&action).len(), 0);
+}
+
+#[test]
+fn test_signer_can_revoke_own_approval() {
+    let env = Env::default();
+    let (admin, s1, _s2, client) = setup_two_of_three(&env);
+    let new_signer = Address::generate(&env);
+    let action = SignerAction::Add(new_signer.clone());
+
+    client.add_signer(&admin, &new_signer);
+    client.revoke_approval(&admin, &action);
+    assert_eq!(client.pending_approvals(&action).len(), 0);
+
+    // With the first approval revoked, a second signer only reaches 1 of 2.
+    client.add_signer(&s1, &new_signer);
+    assert_eq!(client.signers().len(), 3);
+}
+
+#[test]
+fn test_revoke_approval_rejects_non_signer() {
+    let env = Env::default();
+    let (_admin, _s1, _s2, client) = setup_two_of_three(&env);
+    let outsider = Address::generate(&env);
+    let action = SignerAction::SetThreshold(1);
+    assert_eq!(
+        client.try_revoke_approval(&outsider, &action),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn test_write_path_extends_instance_ttl() {
+    use soroban_sdk::testutils::storage::Instance as _;
+    let env = Env::default();
+    let (admin, contract_id, client) = setup(&env);
+    let ttl = || env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert_eq!(ttl(), INSTANCE_TTL_EXTEND_TO);
+
+    let start = env.ledger().sequence();
+    env.ledger()
+        .set_sequence_number(start + INSTANCE_TTL_EXTEND_TO - INSTANCE_TTL_THRESHOLD + 10);
+    assert!(ttl() < INSTANCE_TTL_THRESHOLD);
+
+    client.add_to_denylist(&admin, &Address::generate(&env));
+    assert_eq!(ttl(), INSTANCE_TTL_EXTEND_TO);
 }

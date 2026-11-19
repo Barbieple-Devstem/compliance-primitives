@@ -86,6 +86,13 @@ pub(crate) const ALLOWED_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
 /// Maximum number of addresses accepted by a batch allowlist operation.
 pub const MAX_BATCH_SIZE: u32 = 45;
 
+/// Instance-storage TTL policy: whenever the remaining instance TTL drops
+/// below [`INSTANCE_TTL_THRESHOLD`], it is bumped back up to
+/// [`INSTANCE_TTL_EXTEND_TO`]. Matches `compliance-aggregator`.
+pub const INSTANCE_TTL_THRESHOLD: u32 = 120_960; // ~7 days
+/// Target instance TTL after an extension.
+pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -201,6 +208,36 @@ pub struct UpgradeCommitted {
     pub new_wasm: BytesN<32>,
 }
 
+/// Emitted when `set_compliance_officer` assigns the compliance-officer role.
+/// `previous` is the officer being replaced, if one was assigned.
+#[contractevent]
+pub struct ComplianceOfficerSet {
+    #[topic]
+    pub admin: Address,
+    #[topic]
+    pub officer: Address,
+    pub previous: Option<Address>,
+}
+
+/// Emitted when `revoke_compliance_officer` clears the compliance-officer role.
+/// `previous` is the officer that was revoked, if one was assigned.
+#[contractevent]
+pub struct ComplianceOfficerRevoked {
+    #[topic]
+    pub admin: Address,
+    pub previous: Option<Address>,
+}
+
+/// Emitted when `set_delegated_admin_key` registers or rotates the ed25519
+/// key that may authorize delegated admin actions.
+#[contractevent]
+pub struct DelegatedAdminKeySet {
+    #[topic]
+    pub admin: Address,
+    pub previous: Option<BytesN<32>>,
+    pub pubkey: BytesN<32>,
+}
+
 #[contractevent]
 pub struct Paused {
     #[topic]
@@ -270,6 +307,7 @@ impl AllowlistToken {
     /// address of the underlying SEP-41 token contract that real transfers
     /// are forwarded to once both parties clear the allowlist check.
     pub fn initialize(env: Env, admin: Address, token: Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::AlreadyInitialized);
         }
@@ -304,15 +342,27 @@ impl AllowlistToken {
     /// actions without the admin account itself needing to submit the
     /// transaction. The direct-auth path remains unchanged and still uses
     /// `admin.require_auth()`. Admin-only.
+    ///
+    /// Emits `DelegatedAdminKeySet { admin, previous, pubkey }`.
     pub fn set_delegated_admin_key(
         env: Env,
         admin: Address,
         pubkey: BytesN<32>,
     ) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
+        let previous: Option<BytesN<32>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DelegatedAdminPubKey);
         env.storage()
             .instance()
             .set(&DataKey::DelegatedAdminPubKey, &pubkey);
+        DelegatedAdminKeySet {
+            admin,
+            previous,
+            pubkey,
+        }
+        .publish(&env);
         Ok(())
     }
 
@@ -480,11 +530,14 @@ impl AllowlistToken {
 
     /// Remove every address from the allowlist. Admin or compliance officer;
     /// each address emits an individual `AllowRemove` event.
+    ///
+    /// Returns `Err(ContractPaused)` if the contract is currently paused.
     pub fn remove_multiple_from_allowlist(
         env: Env,
         admin: Address,
         addresses: Vec<Address>,
     ) -> Result<(), Error> {
+        Self::reject_if_paused(&env)?;
         Self::require_compliance_authority(&env, &admin)?;
         if addresses.len() > MAX_BATCH_SIZE {
             return Err(Error::BatchTooLarge);
@@ -604,18 +657,37 @@ impl AllowlistToken {
     }
 
     /// Assign the compliance-officer role. Admin-only.
+    ///
+    /// Emits `ComplianceOfficerSet { admin, officer, previous }`.
     pub fn set_compliance_officer(env: Env, admin: Address, officer: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
+        let previous: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ComplianceOfficer);
         env.storage()
             .instance()
             .set(&DataKey::ComplianceOfficer, &officer);
+        ComplianceOfficerSet {
+            admin,
+            officer,
+            previous,
+        }
+        .publish(&env);
         Ok(())
     }
 
     /// Revoke the compliance-officer role. Admin-only.
+    ///
+    /// Emits `ComplianceOfficerRevoked { admin, previous }`.
     pub fn revoke_compliance_officer(env: Env, admin: Address) -> Result<(), Error> {
         Self::require_admin(&env, &admin)?;
+        let previous: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ComplianceOfficer);
         env.storage().instance().remove(&DataKey::ComplianceOfficer);
+        ComplianceOfficerRevoked { admin, previous }.publish(&env);
         Ok(())
     }
 
@@ -650,6 +722,7 @@ impl AllowlistToken {
 
     /// Accept a pending admin transfer. Must be called by the proposed admin.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
         new_admin.require_auth();
 
         let pending_admin: Address = env
@@ -788,6 +861,7 @@ impl AllowlistToken {
     /// extend the entry's TTL; transfer checks refresh existing entries when
     /// their remaining TTL falls below the configured threshold.
     pub fn is_allowed(env: Env, address: Address) -> bool {
+        Self::extend_instance_ttl(&env);
         let entry: Option<AllowlistEntry> =
             env.storage().persistent().get(&DataKey::Allowed(address));
         match entry {
@@ -825,8 +899,9 @@ impl AllowlistToken {
     ///
     /// While paused:
     /// - `transfer` returns `Err(ContractPaused)`.
-    /// - `add_to_allowlist`, `add_to_allowlist_delegated`, and
-    ///   `remove_from_allowlist` return `Err(ContractPaused)`.
+    /// - `add_to_allowlist`, `add_to_allowlist_delegated`,
+    ///   `remove_from_allowlist`, and `remove_multiple_from_allowlist` return
+    ///   `Err(ContractPaused)`.
     ///
     /// The following are deliberately **not** blocked by pause so that an
     /// operator can always recover from an incident:
@@ -873,6 +948,7 @@ impl AllowlistToken {
     /// existing allowlist entry extends its TTL when it falls below the
     /// configured threshold.
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) -> Result<bool, Error> {
+        Self::extend_instance_ttl(&env);
         if amount < 0 {
             return Err(Error::InvalidInput);
         }
@@ -908,12 +984,21 @@ impl AllowlistToken {
     // Private helpers
     // -----------------------------------------------------------------------
 
+
+    /// Extends the instance entry TTL. Soroban does not extend instance TTL
+    /// implicitly on invocation, so every write path calls this explicitly.
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+    }
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
         admin.require_auth();
         Self::require_configured_admin(env, admin)
     }
 
     fn require_configured_admin(env: &Env, admin: &Address) -> Result<(), Error> {
+        Self::extend_instance_ttl(&env);
         let stored_admin: Address = env
             .storage()
             .instance()

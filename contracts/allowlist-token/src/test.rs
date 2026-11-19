@@ -865,6 +865,165 @@ fn test_revoked_officer_can_no_longer_remove_from_allowlist() {
     assert!(client.is_allowed(&alice));
 }
 
+// ─── Role / key change events (#750) ─────────────────────────────────────────
+
+#[test]
+fn test_set_compliance_officer_emits_event_with_previous() {
+    let env = Env::default();
+    let (admin, _token_id, contract_id, client) = setup(&env);
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+
+    client.set_compliance_officer(&admin, &first);
+    let events = env.events().all();
+    let (id, topics, data) = events.last().unwrap();
+    assert_eq!(id, contract_id);
+    assert_eq!(
+        topics,
+        (
+            Symbol::new(&env, "compliance_officer_set"),
+            admin.clone(),
+            first.clone(),
+        )
+            .into_val(&env)
+    );
+    assert_eq!(
+        data,
+        Map::<Symbol, Val>::from_array(
+            &env,
+            [(
+                Symbol::new(&env, "previous"),
+                Option::<Address>::None.into_val(&env),
+            )],
+        )
+        .into_val(&env)
+    );
+
+    client.set_compliance_officer(&admin, &second);
+    let events = env.events().all();
+    let (id, topics, data) = events.last().unwrap();
+    assert_eq!(id, contract_id);
+    assert_eq!(
+        topics,
+        (
+            Symbol::new(&env, "compliance_officer_set"),
+            admin.clone(),
+            second.clone(),
+        )
+            .into_val(&env)
+    );
+    assert_eq!(
+        data,
+        Map::<Symbol, Val>::from_array(
+            &env,
+            [(Symbol::new(&env, "previous"), Some(first).into_val(&env))],
+        )
+        .into_val(&env)
+    );
+}
+
+#[test]
+fn test_revoke_compliance_officer_emits_event_with_previous() {
+    let env = Env::default();
+    let (admin, _token_id, contract_id, client) = setup(&env);
+    let officer = Address::generate(&env);
+    client.set_compliance_officer(&admin, &officer);
+
+    client.revoke_compliance_officer(&admin);
+
+    let events = env.events().all();
+    let (id, topics, data) = events.last().unwrap();
+    assert_eq!(id, contract_id);
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "compliance_officer_revoked"), admin.clone()).into_val(&env)
+    );
+    assert_eq!(
+        data,
+        Map::<Symbol, Val>::from_array(
+            &env,
+            [(Symbol::new(&env, "previous"), Some(officer).into_val(&env))],
+        )
+        .into_val(&env)
+    );
+}
+
+#[test]
+fn test_revoke_compliance_officer_without_officer_emits_none_previous() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+
+    client.revoke_compliance_officer(&admin);
+
+    let events = env.events().all();
+    let (_, topics, data) = events.last().unwrap();
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "compliance_officer_revoked"), admin).into_val(&env)
+    );
+    assert_eq!(
+        data,
+        Map::<Symbol, Val>::from_array(
+            &env,
+            [(
+                Symbol::new(&env, "previous"),
+                Option::<Address>::None.into_val(&env),
+            )],
+        )
+        .into_val(&env)
+    );
+}
+
+#[test]
+fn test_set_delegated_admin_key_emits_event_with_old_and_new_key() {
+    let env = Env::default();
+    let (admin, _token_id, contract_id, client) = setup(&env);
+    let first = BytesN::from_array(&env, &[1; 32]);
+    let second = BytesN::from_array(&env, &[2; 32]);
+
+    client.set_delegated_admin_key(&admin, &first);
+    let events = env.events().all();
+    let (id, topics, data) = events.last().unwrap();
+    assert_eq!(id, contract_id);
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "delegated_admin_key_set"), admin.clone()).into_val(&env)
+    );
+    assert_eq!(
+        data,
+        Map::<Symbol, Val>::from_array(
+            &env,
+            [
+                (
+                    Symbol::new(&env, "previous"),
+                    Option::<BytesN<32>>::None.into_val(&env),
+                ),
+                (Symbol::new(&env, "pubkey"), first.clone().into_val(&env)),
+            ],
+        )
+        .into_val(&env)
+    );
+
+    client.set_delegated_admin_key(&admin, &second);
+    let events = env.events().all();
+    let (_, topics, data) = events.last().unwrap();
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "delegated_admin_key_set"), admin).into_val(&env)
+    );
+    assert_eq!(
+        data,
+        Map::<Symbol, Val>::from_array(
+            &env,
+            [
+                (Symbol::new(&env, "previous"), Some(first).into_val(&env)),
+                (Symbol::new(&env, "pubkey"), second.into_val(&env)),
+            ],
+        )
+        .into_val(&env)
+    );
+}
+
 // ─── Pause / unpause / is_paused (#358) ──────────────────────────────────────
 
 #[test]
@@ -923,6 +1082,25 @@ fn test_pause_blocks_remove_from_allowlist() {
     );
     // Entry must still be there — the allowlist must stay frozen.
     assert!(client.is_allowed(&alice));
+}
+
+#[test]
+fn test_pause_blocks_remove_multiple_from_allowlist() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    client.add_multiple_to_allowlist(&admin, &vec![&env, alice.clone(), bob.clone()], &None);
+
+    client.pause(&admin);
+
+    assert_eq!(
+        client.try_remove_multiple_from_allowlist(&admin, &vec![&env, alice.clone(), bob.clone()]),
+        Err(Ok(Error::ContractPaused))
+    );
+    // Entries must still be there — the allowlist must stay frozen.
+    assert!(client.is_allowed(&alice));
+    assert!(client.is_allowed(&bob));
 }
 
 #[test]

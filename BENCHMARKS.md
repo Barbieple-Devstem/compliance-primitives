@@ -556,3 +556,42 @@ To re-record the baseline after an intentional change:
 cargo test -p compliance-aggregator budget_regression -- --nocapture
 # copy the printed `cpu = … , memory = …` values into budget-baselines.toml
 ```
+
+## Compliance-Aggregator: `check_address` vs. `check_all`
+
+Issuers wiring the aggregator into a token's `transfer` path can call either
+`check_address` once per address or `check_all` once for a batch. Both run the
+same checks for each address. The difference is how often the fixed
+per-invocation overhead is paid:
+
+| Cost component | `check_address` × N | `check_all` (N addresses) |
+|---|---|---|
+| Consumer → aggregator invocations | N | 1 |
+| Aggregator instance-storage reads (gate, flag, breaker) | 3 × N | 3 |
+| `circuit-breaker.is_frozen` calls | N | 1 |
+| Downstream primitive calls (denylist + jurisdiction) | 2 × N | 2 × N |
+
+**Scenario** (`bench_check_address_vs_check_all_batch_sizes` in
+`contracts/compliance-aggregator/src/test.rs`): both `denylist-gate` and
+`jurisdiction-flag` registered, every address permitted, a fresh `Env` for
+each batch size N ∈ {1, 2, 5, 10, 25}. For each N the test prints the CPU and
+memory used by `check_address` × N and by one `check_all`, plus the CPU ratio:
+
+```bash
+cargo test -p compliance-aggregator bench_check_address_vs_check_all -- --nocapture
+```
+
+**Reference point**: the `check_address` budget baseline (a ceiling of
+~1.5M CPU / ~400 KB memory per call, `[compliance-aggregator.check_address]`
+in `budget-baselines.toml`) is mostly the two downstream calls. So for any N,
+total cost is roughly 2 × N downstream calls, and batching only removes the
+fixed per-invocation overhead.
+
+**Guidance**:
+
+| Batch size | Recommendation |
+|---|---|
+| 1 | `check_address`. Smallest return value. |
+| 2 (sender + recipient) | Either. `check_all` saves one aggregator frame, 3 reads and one breaker call. This is small next to the 4 downstream calls both paths make. |
+| 5–10 | `check_all`, or `batch_check` if per-check detail isn't needed. |
+| 25–45 | `batch_check`, which enforces `MAX_BATCH_SIZE` = 45. `check_all` has no size cap, and its per-address breakdown dominates memory at this size. Split larger batches across transactions. |
