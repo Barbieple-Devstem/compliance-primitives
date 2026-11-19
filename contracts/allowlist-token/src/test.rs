@@ -1622,3 +1622,34 @@ fn test_allowlist_count_tracks_only_real_state_changes() {
     client.remove_multiple_from_allowlist(&admin, &vec![&env, a.clone(), b.clone()]);
     assert_eq!(client.allowlist_count(), 0);
 }
+
+#[test]
+fn test_is_allowed_batch_returns_results_in_input_order() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let listed = Address::generate(&env);
+    let unlisted = Address::generate(&env);
+    client.add_to_allowlist(&admin, &listed, &None);
+
+    let addresses = vec![&env, unlisted.clone(), listed.clone(), unlisted.clone()];
+    assert_eq!(
+        client.is_allowed_batch(&addresses),
+        vec![&env, false, true, false]
+    );
+    assert_eq!(client.is_allowed_batch(&Vec::new(&env)), Vec::new(&env));
+}
+
+#[test]
+fn test_is_allowed_batch_rejects_batches_over_limit() {
+    let env = Env::default();
+    let (_admin, _token_id, _contract_id, client) = setup(&env);
+    let mut addresses = Vec::new(&env);
+    for _ in 0..=MAX_BATCH_SIZE {
+        addresses.push_back(Address::generate(&env));
+    }
+
+    assert_eq!(
+        client.try_is_allowed_batch(&addresses),
+        Err(Ok(Error::BatchTooLarge))
+    );
+}

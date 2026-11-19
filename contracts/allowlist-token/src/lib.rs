@@ -849,6 +849,24 @@ impl AllowlistToken {
         }
     }
 
+    /// Batch form of [`is_allowed`]: returns one `bool` per input address, in
+    /// the same order. Accepts at most [`MAX_BATCH_SIZE`] addresses and
+    /// returns `Err(BatchTooLarge)` otherwise, so integrators can check many
+    /// holders in a single call.
+    ///
+    /// Not affected by pause state — reads always succeed. Like `is_allowed`,
+    /// it does not extend entry TTLs.
+    pub fn is_allowed_batch(env: Env, addresses: Vec<Address>) -> Result<Vec<bool>, Error> {
+        if addresses.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+        let mut results = Vec::new(&env);
+        for address in addresses.iter() {
+            results.push_back(Self::is_allowed(env.clone(), address));
+        }
+        Ok(results)
+    }
+
     /// Returns the raw allowlist entry stored for `address`, if any.
     ///
     /// An already-expired entry is still returned here (it is only ignored,
