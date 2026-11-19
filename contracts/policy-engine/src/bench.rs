@@ -340,3 +340,90 @@ fn bench_short_circuit_order_matters_all() {
         result_ab
     );
 }
+
+// ---------------------------------------------------------------------------
+// Verbose failure reporting: CombineOp::All vs CombineOp::Any
+//
+// `evaluate_verbose` reports *which* check caused a rejection:
+// - Under `CombineOp::All`: the first failing check is reported by its index.
+// - Under `CombineOp::Any`: every check failed, so no single check is to
+//   blame.  The failure is reported with the sentinel `check_index == u32::MAX`
+//   and `kind == "AllFailed"`.
+// ---------------------------------------------------------------------------
+
+/// **All / verbose failure**: the second registered check fails, so
+/// `evaluate_verbose` reports `check_index == 1` with that check's kind.
+#[test]
+fn bench_verbose_all_reports_first_failing_check() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    // Check 0 (denylist): passes — neither address denied.
+    let deny0 = make_denylist(&env, None);
+    // Check 1 (denylist): fails — `from` denied.
+    let deny1 = make_denylist(&env, Some(&from));
+    // Check 2 (denylist): would fail too, but never reached.
+    let deny2 = make_denylist(&env, Some(&to));
+
+    let (admin, client) = setup_engine(&env, CombineOp::All);
+    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny0 }));
+    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny1 }));
+    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny2 }));
+
+    let failure = client.evaluate_verbose(&from, &to);
+    assert_eq!(failure.check_index, 1, "expected first failing check at index 1");
+    assert_eq!(failure.kind, String::from_str(&env, "Denylist"));
+
+    std::println!(
+        "[bench_verbose_all] check_index={} kind={:?}  (first failing check reported)",
+        failure.check_index,
+        failure.kind
+    );
+}
+
+/// **Any / verbose failure**: all checks fail, so `evaluate_verbose` must not
+/// blame an arbitrary check.  It reports the `u32::MAX` / `"AllFailed"`
+/// sentinel instead.
+#[test]
+fn bench_verbose_any_reports_all_failed_sentinel() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    // Check 0 (jurisdiction): fails — no jurisdiction code set.
+    let juri0 = env.register(MockJurisdiction, ());
+    // Check 1 (denylist): `from` denied → fails.
+    let deny1 = make_denylist(&env, Some(&from));
+    // Check 2 (denylist): `to` denied → fails.
+    let deny2 = make_denylist(&env, Some(&to));
+
+    let (admin, client) = setup_engine(&env, CombineOp::Any);
+    client.add_check(
+        &admin,
+        &CheckKind::Jurisdiction(JurisdictionCheck {
+            contract: juri0,
+            allowed_codes: vec![&env, String::from_str(&env, "US")],
+        }),
+    );
+    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny1 }));
+    client.add_check(&admin, &CheckKind::Denylist(DenylistCheck { contract: deny2 }));
+
+    let failure = client.evaluate_verbose(&from, &to);
+    assert_eq!(
+        failure.check_index,
+        u32::MAX,
+        "Any failure must not blame an arbitrary check"
+    );
+    assert_eq!(failure.kind, String::from_str(&env, "AllFailed"));
+
+    std::println!(
+        "[bench_verbose_any] check_index={} kind={:?}  (all checks failed sentinel)",
+        failure.check_index,
+        failure.kind
+    );
+}

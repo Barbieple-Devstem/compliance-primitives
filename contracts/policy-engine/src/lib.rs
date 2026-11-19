@@ -667,11 +667,15 @@ impl PolicyEngine {
     /// Like `evaluate`, but on failure also returns a [`CheckFailure`] with
     /// details appropriate to the configured combine operation.
     ///
-    /// Returns `Ok((true, None))` when the policy passes. Returns
-    /// `Ok((false, Some(CheckFailure { check_index, kind })))` when an `All`
-    /// policy fails, reporting the first failing check. For a failed `Any`
-    /// policy, `check_index` is `u32::MAX` and `kind` is `"AllFailed"` because
-    /// every check failed and no individual check is representative.
+    /// Returns `Ok((true, None))` when the policy passes.
+    ///
+    /// On failure the reported [`CheckFailure`] depends on the operator:
+    ///
+    /// - **`CombineOp::All`** — the first failing check is reported: its
+    ///   zero-based `check_index` and its `kind` (e.g. `"Denylist"`).
+    /// - **`CombineOp::Any`** — every check failed, so no individual check is
+    ///   blamed. The sentinel `check_index == u32::MAX` with
+    ///   `kind == "AllFailed"` is returned instead.
     ///
     /// A `PolicyResult` event is emitted just as in `evaluate`, keeping the
     /// audit trail intact regardless of the outcome. The circuit-breaker
@@ -753,6 +757,9 @@ impl PolicyEngine {
                     if any_pass {
                         (true, None)
                     } else {
+                        // Every check failed under `Any`, so no individual
+                        // check is representative. Surface the dedicated
+                        // sentinel rather than blaming an arbitrary index.
                         (
                             false,
                             Some(CheckFailure {

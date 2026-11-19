@@ -17,7 +17,7 @@
 
 use crate::{
     AllowlistCheck, CheckKind, CombineOp, DenylistCheck, JurisdictionCheck, PolicyEngine,
-    PolicyEngineClient,
+    PolicyEngineClient, VerboseResult,
 };
 use allowlist_token::{AllowlistToken, AllowlistTokenClient};
 use denylist_gate::{DenylistGate, DenylistGateClient};
@@ -365,4 +365,134 @@ fn test_or_semantics_any_check_passes() {
         engine.evaluate(&from, &to),
         "expected Any semantics to return true when at least one check passes for both parties"
     );
+}
+
+/// Verbose reporting under `All`: only the denylist gate trips, so
+/// `evaluate_verbose` must blame exactly that check (index 1, Denylist kind)
+/// rather than an arbitrary one.
+#[test]
+fn test_verbose_all_reports_failing_check() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let allowlist_admin = Address::generate(&env);
+    let denylist_admin = Address::generate(&env);
+    let issuer = Address::generate(&env);
+
+    let allowlist_id = setup_allowlist(&env, &allowlist_admin);
+    let denylist_id = setup_denylist(&env, &denylist_admin);
+    let jurisdiction_id = setup_jurisdiction(&env, &issuer);
+
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    // Both parties fully onboarded.
+    onboard(
+        &env,
+        &allowlist_id,
+        &allowlist_admin,
+        &jurisdiction_id,
+        &issuer,
+        &from,
+        PERMITTED_CODE,
+    );
+    onboard(
+        &env,
+        &allowlist_id,
+        &allowlist_admin,
+        &jurisdiction_id,
+        &issuer,
+        &to,
+        PERMITTED_CODE,
+    );
+
+    // Only the denylist gate trips (check index 1).
+    DenylistGateClient::new(&env, &denylist_id).add_to_denylist(&denylist_admin, &from);
+
+    let (_admin, engine) =
+        setup_engine_all_three(&env, &allowlist_id, &denylist_id, &jurisdiction_id, PERMITTED_CODE);
+
+    match engine.evaluate_verbose(&from, &to) {
+        VerboseResult::Failed(failure) => {
+            assert_eq!(
+                failure.check_index, 1,
+                "All failure must blame the denylist check at index 1"
+            );
+            assert!(
+                matches!(failure.kind, CheckKind::Denylist(_)),
+                "All failure kind must identify the denylist check"
+            );
+        }
+        VerboseResult::Passed => panic!("expected All policy to fail"),
+    }
+}
+
+/// Verbose reporting under `Any`: every check fails, so the engine must not
+/// blame an arbitrary check.  It reports the `u32::MAX` / `"AllFailed"`
+/// sentinel instead.
+#[test]
+fn test_verbose_any_all_failed_sentinel() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let allowlist_admin = Address::generate(&env);
+    let denylist_admin = Address::generate(&env);
+    let issuer = Address::generate(&env);
+
+    let allowlist_id = setup_allowlist(&env, &allowlist_admin);
+    let denylist_id = setup_denylist(&env, &denylist_admin);
+    let jurisdiction_id = setup_jurisdiction(&env, &issuer);
+
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    // Neither party is allowlisted, both are denylisted, and neither has a
+    // permitted jurisdiction — every check fails for both parties.
+    DenylistGateClient::new(&env, &denylist_id).add_to_denylist(&denylist_admin, &from);
+    DenylistGateClient::new(&env, &denylist_id).add_to_denylist(&denylist_admin, &to);
+    JurisdictionFlagClient::new(&env, &jurisdiction_id)
+        .set_jurisdiction(&issuer, &from, &String::from_str(&env, FORBIDDEN_CODE));
+    JurisdictionFlagClient::new(&env, &jurisdiction_id)
+        .set_jurisdiction(&issuer, &to, &String::from_str(&env, FORBIDDEN_CODE));
+
+    // Build an Any engine wired with all three checks.
+    let engine_admin = Address::generate(&env);
+    let engine_id = env.register(PolicyEngine, ());
+    let engine = PolicyEngineClient::new(&env, &engine_id);
+    engine.initialize(&engine_admin, &CombineOp::Any, &None);
+    engine.add_check(
+        &engine_admin,
+        &CheckKind::Allowlist(AllowlistCheck {
+            contract: allowlist_id.clone(),
+        }),
+    );
+    engine.add_check(
+        &engine_admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: denylist_id.clone(),
+        }),
+    );
+    engine.add_check(
+        &engine_admin,
+        &CheckKind::Jurisdiction(JurisdictionCheck {
+            contract: jurisdiction_id.clone(),
+            allowed_codes: vec![&env, String::from_str(&env, PERMITTED_CODE)],
+        }),
+    );
+
+    match engine.evaluate_verbose(&from, &to) {
+        VerboseResult::Failed(failure) => {
+            assert_eq!(
+                failure.check_index,
+                u32::MAX,
+                "Any failure must use the AllFailed sentinel index, not an arbitrary check"
+            );
+            assert_eq!(
+                failure.kind,
+                CheckKind::AllFailed,
+                "Any failure kind must be the AllFailed sentinel"
+            );
+        }
+        VerboseResult::Passed => panic!("expected Any policy to fail when every check fails"),
+    }
 }

@@ -188,6 +188,64 @@ fn fuzz_policy_engine_tree_and_evaluation() {
                         "seed={seed}: mismatch on evaluate from={from_idx} to={to_idx}"
                     );
 
+                    // Verify verbose evaluation agrees with the bool result and
+                    // follows the documented failure-reporting semantics.
+                    let verbose =
+                        client.evaluate_verbose(&addresses[from_idx], &addresses[to_idx]);
+                    assert_eq!(
+                        verbose.allowed, result,
+                        "seed={seed}: verbose allowed mismatch from={from_idx} to={to_idx}"
+                    );
+                    match (&op, result) {
+                        (CombineOp::All, false) => {
+                            let failure = verbose
+                                .failure
+                                .expect("All failure must report a CheckFailure");
+                            assert!(
+                                (failure.check_index as usize) < registered_checks.len(),
+                                "seed={seed}: All failure check_index {} out of range (len {})",
+                                failure.check_index,
+                                registered_checks.len()
+                            );
+                            let idx = failure.check_index as usize;
+                            assert!(
+                                !check_passes_model(
+                                    &registered_checks[idx],
+                                    from_idx,
+                                    to_idx,
+                                    &gates,
+                                    &flags,
+                                    &denylist_states,
+                                    &jurisdiction_states,
+                                    &all_codes,
+                                ),
+                                "seed={seed}: All failure blamed a passing check at index {idx}"
+                            );
+                        }
+                        (CombineOp::Any, false) => {
+                            let failure = verbose
+                                .failure
+                                .expect("Any failure must report a CheckFailure");
+                            assert_eq!(
+                                failure.check_index,
+                                u32::MAX,
+                                "seed={seed}: Any failure must use check_index u32::MAX"
+                            );
+                            assert_eq!(
+                                failure.kind,
+                                String::from_str(&env, "AllFailed"),
+                                "seed={seed}: Any failure must use kind AllFailed"
+                            );
+                        }
+                        (_, true) => {
+                            assert!(
+                                verbose.failure.is_none(),
+                                "seed={seed}: passing evaluation must not report a failure"
+                            );
+                        }
+                        _ => {}
+                    }
+
                     // Test batch evaluate
                     let mut pairs = Vec::new(&env);
                     pairs.push_back(AddressPair {
@@ -221,6 +279,40 @@ fn fuzz_policy_engine_tree_and_evaluation() {
             }
         }
     }
+}
+
+/// Returns whether a single check passes for the given transfer under the model.
+#[allow(clippy::too_many_arguments)]
+fn check_passes_model(
+    check: &CheckKind,
+    from_idx: usize,
+    to_idx: usize,
+    gates: &[Address],
+    flags: &[Address],
+    denylist_states: &[std::vec::Vec<bool>],
+    jurisdiction_states: &[std::vec::Vec<usize>],
+    all_codes: &[&str],
+) -> bool {
+    let run_check_model = |check: &CheckKind, addr_idx: usize| -> bool {
+        match check {
+            CheckKind::Denylist(inner) => {
+                let gate_idx = gates.iter().position(|id| id == &inner.contract).unwrap();
+                let is_denylisted = denylist_states[gate_idx][addr_idx];
+                !is_denylisted
+            }
+            CheckKind::Jurisdiction(inner) => {
+                let flag_idx = flags.iter().position(|id| id == &inner.contract).unwrap();
+                let code_idx = jurisdiction_states[flag_idx][addr_idx];
+                let code_str = all_codes[code_idx];
+                inner.allowed_codes.iter().any(|code| code.to_string() == code_str)
+            }
+            CheckKind::Allowlist(_) => true,
+            // The fuzz harness never registers circuit-breaker checks.
+            CheckKind::CircuitBreaker(_) => true,
+        }
+    };
+
+    run_check_model(check, from_idx) && run_check_model(check, to_idx)
 }
 
 #[allow(clippy::too_many_arguments)]
