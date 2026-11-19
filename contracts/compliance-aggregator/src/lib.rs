@@ -23,7 +23,7 @@
 //!   `set_circuit_breaker`, `set_admin`, `pause`, `unpause`, and `upgrade`.
 //!   Every mutation requires the admin's auth.
 //! - **Off-chain tooling and auditors** call the read-only views
-//!   (`get_config`, `get_checks_summary`, `is_paused`) and consume the
+//!   (`get_admin`, `get_config`, `get_checks_summary`, `is_paused`) and consume the
 //!   configuration events to reconstruct which checks were registered when.
 //!
 //! ## Composition
@@ -68,6 +68,47 @@
 //! All checks are optional; if a check type's contract address has not been
 //! registered the check is skipped (treated as passing). Registering at least
 //! one check is enforced at call time.
+//!
+//! ## Choosing `check_address` vs. `check_all`
+//!
+//! Both entry points run the same checks per address; they differ in how the
+//! fixed per-invocation overhead is amortised.
+//!
+//! | Cost component | `check_address` × N | `check_all` (N addresses) |
+//! |---|---|---|
+//! | Consumer → aggregator invocations | N | 1 |
+//! | Aggregator instance-storage reads (gate, flag, breaker) | 3 × N | 3 |
+//! | `circuit-breaker.is_frozen` calls | N | 1 |
+//! | Downstream primitive calls (denylist + jurisdiction) | 2 × N | 2 × N |
+//! | Return payload | N × `(bool, Vec<CheckResult>)` | 1 × `Vec<AddressCheckResult>` (also carries each `Address`) |
+//!
+//! The recorded `check_address` baseline (both checks registered, no breaker)
+//! is a ceiling of **~1.5M CPU instructions / ~400 KB memory** per call
+//! (`[compliance-aggregator.check_address]` in `budget-baselines.toml`).
+//! Almost all of that is the two downstream calls, so the cost model is:
+//!
+//! - `check_address` × N ≈ N × (aggregator frame + 3 reads + 2 downstream calls)
+//! - `check_all` ≈ 1 × (aggregator frame + 3 reads) + N × (2 downstream calls)
+//!
+//! Guidance for a token's `transfer` path, at representative batch sizes:
+//!
+//! | Batch size | Typical shape | Recommendation |
+//! |---|---|---|
+//! | 1 | Single sender check | `check_address`: smallest return value, no `Address` echoed back. |
+//! | 2 | Sender + recipient (the common `transfer` case) | Either. `check_all` saves one aggregator frame, 3 storage reads and one breaker call; `check_address` × 2 is simpler to branch on. The difference is small next to the 4 downstream calls both make. |
+//! | 5–10 | Multi-party settlement, batch payouts | `check_all` (or `batch_check` if you only need booleans). The saved fixed overhead grows linearly with N. |
+//! | 25–45 | Bulk distribution, airdrop pre-screen | `batch_check`, which caps input at `MAX_BATCH_SIZE` (45). `check_all` has no cap, and its per-address `Vec<CheckResult>` breakdown makes the return payload the largest memory cost at this size. Split anything above 45 across transactions. |
+//!
+//! Total cost at every size is dominated by the 2 × N downstream calls, which
+//! neither entry point avoids. Batching only removes the per-invocation
+//! overhead. Per-size figures for the configuration above come from
+//! `bench_check_address_vs_check_all_batch_sizes` in `src/test.rs`:
+//!
+//! ```text
+//! cargo test -p compliance-aggregator bench_check_address_vs_check_all -- --nocapture
+//! ```
+//!
+//! See the "check_address vs. check_all" section of `BENCHMARKS.md`.
 //!
 //! ## Upgradeability
 //!
@@ -464,6 +505,16 @@ impl ComplianceAggregator {
     // -----------------------------------------------------------------------
     // Read helpers
     // -----------------------------------------------------------------------
+
+    /// Returns the configured admin address.
+    ///
+    /// Returns `Error::NotInitialized` if `initialize` has not been called.
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
 
     /// Returns the currently registered `denylist-gate` address, if any.
     pub fn denylist_gate(env: Env) -> Option<Address> {
