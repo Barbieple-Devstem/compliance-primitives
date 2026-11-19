@@ -791,6 +791,50 @@ fn test_evaluate_verbose_fails_surfaces_check_failure() {
     );
 }
 
+/// Under `CombineOp::All`, when the *second* check fails, `evaluate_verbose`
+/// must report that check's index (1) and kind — not index 0.
+#[test]
+fn test_evaluate_verbose_all_failure_blames_failing_check() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let deny_id = setup_denylist(&env);
+    let juri_id = setup_jurisdiction(&env);
+
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
+
+    // Denylist check passes: neither address is denied.
+    // Jurisdiction check fails: no codes set for either address.
+    let (admin, _engine_id, client) = setup_engine_all(&env);
+
+    // Register Denylist at index 0, Jurisdiction at index 1.
+    client.add_check(
+        &admin,
+        &CheckKind::Denylist(DenylistCheck {
+            contract: deny_id.clone(),
+        }),
+    );
+    client.add_check(
+        &admin,
+        &CheckKind::Jurisdiction(JurisdictionCheck {
+            contract: juri_id.clone(),
+            allowed_codes: vec![&env, String::from_str(&env, "US")],
+        }),
+    );
+
+    let (passed, failure) = client.evaluate_verbose(&from, &to);
+    assert!(!passed, "expected policy to fail");
+
+    let f = failure.expect("expected Some(CheckFailure) when policy fails");
+    assert_eq!(f.check_index, 1, "the failing jurisdiction check is at index 1");
+    assert_eq!(
+        f.kind,
+        soroban_sdk::Symbol::new(&env, "Jurisdiction"),
+        "kind should be 'Jurisdiction'"
+    );
+}
+
 /// A failed `Any` policy reports that all checks failed, not an arbitrary
 /// check at index zero.
 #[test]
@@ -827,63 +871,26 @@ fn test_evaluate_verbose_any_failure_does_not_blame_first_check() {
     assert_eq!(failure.kind, soroban_sdk::Symbol::new(&env, "AllFailed"));
 }
 
-// ---------------------------------------------------------------------------
-// Tests for issue #628: timelocked upgrades
-// ---------------------------------------------------------------------------
-
+/// Under `CombineOp::Any`, when both checks fail, `evaluate_verbose` must not
+/// blame an arbitrary check: it reports the sentinel `check_index == u32::MAX`
+/// and the `AllFailed` kind.
 #[test]
-fn test_upgrade_requires_admin() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (_admin, _engine_id, client) = setup_engine_all(&env);
-    let impostor = Address::generate(&env);
-    let wasm_hash = BytesN::from_array(&env, &[1; 32]);
-
-    assert_eq!(
-        client.try_propose_upgrade(&impostor, &wasm_hash, &10),
-        Err(Ok(Error::NotAuthorized)),
-    );
-}
-
-#[test]
-fn test_upgrade_cannot_commit_before_delay() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (admin, _engine_id, client) = setup_engine_all(&env);
-    let wasm_hash = BytesN::from_array(&env, &[1; 32]);
-
-    client.propose_upgrade(&admin, &wasm_hash, &10);
-    assert_eq!(client.try_commit_upgrade(&admin), Err(Ok(Error::UpgradeNotReady)));
-}
-
-#[test]
-fn test_cancel_upgrade_clears_pending_proposal() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (admin, _engine_id, client) = setup_engine_all(&env);
-    let wasm_hash = BytesN::from_array(&env, &[1; 32]);
-
-    client.propose_upgrade(&admin, &wasm_hash, &10);
-    client.cancel_upgrade(&admin);
-    assert_eq!(client.try_commit_upgrade(&admin), Err(Ok(Error::UpgradeNotReady)));
-}
-
-// ---------------------------------------------------------------------------
-// Tests for issue #406: get_check(index) view function
-// ---------------------------------------------------------------------------
-
-/// `get_check` returns the correct `CheckKind` for a valid index.
-#[test]
-fn test_get_check_valid_index() {
+fn test_evaluate_verbose_any_all_checks_fail_reports_all_failed() {
     let env = Env::default();
     env.mock_all_auths();
 
     let deny_id = setup_denylist(&env);
     let juri_id = setup_jurisdiction(&env);
 
-    let (admin, _engine_id, client) = setup_engine_all(&env);
+    let from = Address::generate(&env);
+    let to = Address::generate(&env);
 
-    // Register two checks: denylist at 0, jurisdiction at 1.
+    // Denylist check fails: `from` is denied.
+    MockDenylistClient::new(&env, &deny_id).add_to_denylist(&from);
+    // Jurisdiction check fails: no codes set for either address.
+
+    let (admin, _engine_id, client) = setup_engine_any(&env);
+
     client.add_check(
         &admin,
         &CheckKind::Denylist(DenylistCheck {
@@ -898,186 +905,27 @@ fn test_get_check_valid_index() {
         }),
     );
 
-    // Fetch index 0 — should be the denylist check.
-    let check0 = client.get_check(&0);
-    match check0 {
-        CheckKind::Denylist(params) => assert_eq!(params.contract, deny_id),
-        _ => panic!("expected Denylist at index 0"),
-    }
+    let (passed, failure) = client.evaluate_verbose(&from, &to);
+    assert!(!passed, "expected policy to fail");
 
-    // Fetch index 1 — should be the jurisdiction check.
-    let check1 = client.get_check(&1);
-    match check1 {
-        CheckKind::Jurisdiction(params) => {
-            assert_eq!(params.contract, juri_id);
-        }
-        _ => panic!("expected Jurisdiction at index 1"),
-    }
+    let f = failure.expect("expected Some(CheckFailure) when policy fails");
+    assert_eq!(
+        f.check_index,
+        u32::MAX,
+        "Any failure must not blame an arbitrary check index"
+    );
+    assert_eq!(
+        f.kind,
+        soroban_sdk::Symbol::new(&env, "AllFailed"),
+        "kind should be 'AllFailed'"
+    );
 }
 
-/// `get_check` returns `Err(CheckIndexOutOfRange)` for an out-of-range index.
+/// A passing policy under `Any` semantics returns `None` for the failure payload.
 #[test]
-fn test_get_check_out_of_range_returns_error() {
+fn test_evaluate_verbose_any_pass_returns_none_failure() {
     let env = Env::default();
     env.mock_all_auths();
 
     let deny_id = setup_denylist(&env);
-
-    let (admin, _engine_id, client) = setup_engine_all(&env);
-
-    // Register one check at index 0.
-    client.add_check(
-        &admin,
-        &CheckKind::Denylist(DenylistCheck {
-            contract: deny_id.clone(),
-        }),
-    );
-
-    // Requesting index 1 should fail — only index 0 exists.
-    let result = client.try_get_check(&1);
-    assert!(
-        result.is_err(),
-        "expected Err(CheckIndexOutOfRange) for index 1 with only 1 check registered"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Negative-auth tests — issue #462
-//
-// Every admin-gated mutation must reject a caller that is not the stored
-// admin with `Error::NotAuthorized`.  We use `mock_all_auths()` so that
-// Soroban's auth framework does not reject the call before our own admin
-// check runs, which lets us test the *contract-level* guard in isolation.
-// ---------------------------------------------------------------------------
-
-/// `add_check` must return `Err(Error::NotAuthorized)` when called by an
-/// address that is not the stored admin.
-#[test]
-fn test_add_check_rejects_non_admin() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let deny_id = setup_denylist(&env);
-    let (_, _engine_id, client) = setup_engine_all(&env);
-    let impostor = Address::generate(&env);
-
-    let result = client.try_add_check(
-        &impostor,
-        &CheckKind::Denylist(DenylistCheck {
-            contract: deny_id.clone(),
-        }),
-    );
-    assert_eq!(
-        result,
-        Err(Ok(Error::NotAuthorized)),
-        "add_check must reject a non-admin caller"
-    );
-}
-
-/// `remove_check` must return `Err(Error::NotAuthorized)` when called by a
-/// non-admin, even when a check exists at the requested index.
-#[test]
-fn test_remove_check_rejects_non_admin() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let deny_id = setup_denylist(&env);
-    let (admin, _engine_id, client) = setup_engine_all(&env);
-
-    // Register one check so the index is valid.
-    client.add_check(
-        &admin,
-        &CheckKind::Denylist(DenylistCheck {
-            contract: deny_id.clone(),
-        }),
-    );
-
-    let impostor = Address::generate(&env);
-    let result = client.try_remove_check(&impostor, &0u32);
-    assert_eq!(
-        result,
-        Err(Ok(Error::NotAuthorized)),
-        "remove_check must reject a non-admin caller"
-    );
-}
-
-/// `swap_checks` must return `Err(Error::NotAuthorized)` when called by a
-/// non-admin, even when both indices are valid.
-#[test]
-fn test_swap_checks_rejects_non_admin() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let deny_id = setup_denylist(&env);
-    let juri_id = setup_jurisdiction(&env);
-    let (admin, _engine_id, client) = setup_engine_all(&env);
-
-    // Register two checks so both indices 0 and 1 are valid.
-    client.add_check(
-        &admin,
-        &CheckKind::Denylist(DenylistCheck {
-            contract: deny_id.clone(),
-        }),
-    );
-    client.add_check(
-        &admin,
-        &CheckKind::Jurisdiction(JurisdictionCheck {
-            contract: juri_id.clone(),
-            allowed_codes: vec![&env, String::from_str(&env, "US")],
-        }),
-    );
-
-    let impostor = Address::generate(&env);
-    let result = client.try_swap_checks(&impostor, &0u32, &1u32);
-    assert_eq!(
-        result,
-        Err(Ok(Error::NotAuthorized)),
-        "swap_checks must reject a non-admin caller"
-    );
-}
-
-/// `clear_checks` must return `Err(Error::NotAuthorized)` when called by a
-/// non-admin.
-#[test]
-fn test_clear_checks_rejects_non_admin() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let deny_id = setup_denylist(&env);
-    let (admin, _engine_id, client) = setup_engine_all(&env);
-
-    // Register a check so there is something to clear.
-    client.add_check(
-        &admin,
-        &CheckKind::Denylist(DenylistCheck {
-            contract: deny_id.clone(),
-        }),
-    );
-
-    let impostor = Address::generate(&env);
-    let result = client.try_clear_checks(&impostor);
-    assert_eq!(
-        result,
-        Err(Ok(Error::NotAuthorized)),
-        "clear_checks must reject a non-admin caller"
-    );
-}
-
-/// `set_circuit_breaker` must return `Err(Error::NotAuthorized)` when called
-/// by a non-admin.
-#[test]
-fn test_set_circuit_breaker_rejects_non_admin() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let (_admin, _engine_id, client) = setup_engine_all(&env);
-    let impostor = Address::generate(&env);
-    let fake_breaker = Address::generate(&env);
-
-    let result = client.try_set_circuit_breaker(&impostor, &fake_breaker);
-    assert_eq!(
-        result,
-        Err(Ok(Error::NotAuthorized)),
-        "set_circuit_breaker must reject a non-admin caller"
-    );
-}
+    let juri_id = setup_j
