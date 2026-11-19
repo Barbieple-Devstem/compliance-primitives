@@ -24,6 +24,7 @@ to find the right starting point for your use case.
 | [`policy-engine-audit`](./policy-engine-audit) | `policy-engine`, `audit-log` | Policy evaluation results forwarded to the on-chain audit log; shows composing rule-based checks with an immutable compliance trail |
 | [`rwa-compliance-flow`](./rwa-compliance-flow) | `allowlist-token`, `denylist-gate`, `jurisdiction-flag` | Integration test for the full compliance stack: all three primitives evaluated in series with specific per-gate error handling |
 | [`rwa-token`](./rwa-token) | `allowlist-token`, `denylist-gate`, `jurisdiction-flag`, `circuit-breaker` | Reference RWA token composing all four core primitives in one `transfer` path; the most complete production-like example (testnet deployment available) |
+| [`rwa-token-aggregator`](./rwa-token-aggregator) | `compliance-aggregator`, `denylist-gate`, `jurisdiction-flag`, `circuit-breaker` | RWA token whose `transfer` calls only `compliance-aggregator.check_address`; the aggregator is the single top-level gate composing denylist, jurisdiction and circuit-breaker |
 
 ## Which example should I start with?
 
@@ -32,7 +33,9 @@ to find the right starting point for your use case.
   cross-contract composition.
 - **Building a SEP-41 token?** See
   [`denylist-gate-sep41`](./denylist-gate-sep41) for the full interface and
-  [`rwa-token`](./rwa-token) for the production-like multi-gate version.
+  [`rwa-token`](./rwa-token) for the production-like multi-gate version, or
+  [`rwa-token-aggregator`](./rwa-token-aggregator) to gate it through a single
+  `compliance-aggregator` call.
 - **Need an emergency stop?** See
   [`circuit-breaker-policy-engine`](./circuit-breaker-policy-engine).
 - **Need jurisdiction enforcement?** See
