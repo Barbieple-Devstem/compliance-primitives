@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **allowlist-token** (breaking): `add_to_allowlist_delegated` takes a new
+  `valid_until_ledger: u32` argument, and the signed payload is now
+  `allowlist-delegated-v2:<target>:add_to_allowlist:<nonce>:<expiry>:<valid_until_ledger>`.
+  Calls submitted after `valid_until_ledger` are rejected with
+  `ExpiredSignature`, so a leaked unsubmitted signature can no longer be
+  used indefinitely. Signers must move to the v2 payload; v1 signatures are
+  no longer accepted (#765).
+
 ### Fixed
 
 - **allowlist-token**: `pause` now blocks `add_to_allowlist`,
@@ -20,6 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **allowlist-token**: `get_delegated_admin_key() -> Option<BytesN<32>>`
+  view returning the ed25519 key set by `set_delegated_admin_key` (#764).
+- **allowlist-token**: Admin-only `clawback(admin, from, amount)` forwarded
+  to the underlying SEP-41 token's `clawback`, emitting a `Clawback` event.
+  `set_clawback_requires_freeze` / `get_clawback_requires_freeze` optionally
+  require the target to be frozen first (`ClawbackRequiresFreeze`) (#763).
+- **allowlist-token**: `freeze(caller, address)` / `unfreeze(caller, address)`
+  callable by the admin or compliance officer, plus an `is_frozen` view. A
+  frozen address cannot send or receive (`transfer` returns
+  `AddressFrozen`) but keeps its allowlist entry. Emits `AddressFrozen` /
+  `AddressUnfrozen` events (#762).
 - **circuit-breaker**: Guardian set for faster incident response. Admin-managed
   `add_guardian` / `remove_guardian` / `is_guardian`; guardians can call
   `freeze`, while `unfreeze` remains admin-only. `Frozen` event topic renamed

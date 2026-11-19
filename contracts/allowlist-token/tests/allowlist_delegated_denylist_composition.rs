@@ -53,10 +53,18 @@ fn setup_composition(env: &Env) -> Composition<'_> {
     }
 }
 
-/// Signs `allowlist-delegated-v1:<target>:add_to_allowlist:<nonce>:<expiry>`.
-fn sign_add(env: &Env, key: &SigningKey, target: &Address, nonce: u64, expiry: u64) -> BytesN<64> {
+/// Signs
+/// `allowlist-delegated-v2:<target>:add_to_allowlist:<nonce>:<expiry>:<valid_until_ledger>`.
+fn sign_add(
+    env: &Env,
+    key: &SigningKey,
+    target: &Address,
+    nonce: u64,
+    expiry: u64,
+    valid_until_ledger: u32,
+) -> BytesN<64> {
     let mut message = Bytes::new(env);
-    message.append(&Bytes::from_slice(env, b"allowlist-delegated-v1:"));
+    message.append(&Bytes::from_slice(env, b"allowlist-delegated-v2:"));
     let target_str = target.to_string().to_string();
     message.append(&Bytes::from_slice(env, target_str.as_bytes()));
     message.push_back(b':');
@@ -65,6 +73,8 @@ fn sign_add(env: &Env, key: &SigningKey, target: &Address, nonce: u64, expiry: u
     message.append(&Bytes::from_slice(env, nonce.to_string().as_bytes()));
     message.push_back(b':');
     message.append(&Bytes::from_slice(env, expiry.to_string().as_bytes()));
+    message.push_back(b':');
+    message.append(&Bytes::from_slice(env, valid_until_ledger.to_string().as_bytes()));
     BytesN::from_array(env, &key.sign(&message).unwrap())
 }
 
@@ -72,9 +82,16 @@ fn sign_add(env: &Env, key: &SigningKey, target: &Address, nonce: u64, expiry: u
 fn onboard_delegated(env: &Env, c: &Composition<'_>, address: &Address, nonce: u64) {
     use soroban_sdk::testutils::Ledger as _;
     let expiry = env.ledger().timestamp() + 60;
-    let signature = sign_add(env, &c.signing_key, address, nonce, expiry);
-    c.allowlist_token
-        .add_to_allowlist_delegated(&c.allowlist_admin, address, &nonce, &expiry, &signature);
+    let valid_until_ledger = env.ledger().sequence() + 720;
+    let signature = sign_add(env, &c.signing_key, address, nonce, expiry, valid_until_ledger);
+    c.allowlist_token.add_to_allowlist_delegated(
+        &c.allowlist_admin,
+        address,
+        &nonce,
+        &expiry,
+        &valid_until_ledger,
+        &signature,
+    );
 }
 
 #[test]

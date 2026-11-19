@@ -108,7 +108,12 @@
   expired codes have been explicitly re-flagged or removed.
 - [ ] Delegated admin key (allowlist-token): if `set_delegated_admin_key`
   has been called, verify the key is stored securely and the relayer has
-  nonce tracking in place.
+  nonce tracking in place. Confirm that off-chain signers use the
+  `allowlist-delegated-v2` payload
+  (`allowlist-delegated-v2:<target>:add_to_allowlist:<nonce>:<expiry>:<valid_until_ledger>`)
+  and pick a short `valid_until_ledger` (e.g. current ledger + ~720, about one
+  hour) so a leaked, unsubmitted signature expires quickly. The active key
+  can be checked with `get_delegated_admin_key`.
 
 ---
 

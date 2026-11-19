@@ -20,19 +20,31 @@
 //! compliance officer, assigned with `set_compliance_officer` and removed
 //! with `revoke_compliance_officer` (both admin-only), may call
 //! `remove_from_allowlist` but can never grant access or manage roles.
+//! Either role may also `freeze` / `unfreeze` an address: a frozen address
+//! can neither send nor receive, but keeps its allowlist entry, so a holder
+//! can be suspended during an investigation without losing their status.
+//! The admin may `clawback` underlying tokens from an address (forwarded to
+//! the underlying SEP-41 token's `clawback`), optionally only once that
+//! address has been frozen (`set_clawback_requires_freeze`).
 //!
 //! **Delegated actions**: `add_to_allowlist_delegated` lets a relayer submit
 //! an allowlist addition on the admin's behalf, without the admin account
 //! signing the transaction. The admin first registers an ed25519 public key
 //! with `set_delegated_admin_key`. The holder of the matching private key then
 //! signs the payload
-//! `allowlist-delegated-v1:<target>:add_to_allowlist:<nonce>:<expiry>`, where
-//! `<target>` is the address being allowlisted, `<nonce>` is a `u64` and
-//! `<expiry>` is a ledger timestamp in seconds. Each admin has a
-//! replay-protection nonce: a call is rejected with `InvalidNonce` unless
-//! `nonce` is strictly greater than the last accepted one (readable via
-//! `get_delegated_nonce`), and with `ExpiredSignature` once the ledger
-//! timestamp reaches `expiry`. Use this path when the admin key is kept
+//! `allowlist-delegated-v2:<target>:add_to_allowlist:<nonce>:<expiry>:<valid_until_ledger>`,
+//! where `<target>` is the address being allowlisted (strkey), `<nonce>` is a
+//! `u64`, `<expiry>` is a ledger timestamp in seconds and
+//! `<valid_until_ledger>` is the last ledger sequence (inclusive, `u32`) at
+//! which the signature may be submitted. All numbers are base-10 ASCII. Each
+//! admin has a replay-protection nonce: a call is rejected with
+//! `InvalidNonce` unless `nonce` is strictly greater than the last accepted
+//! one (readable via `get_delegated_nonce`), and with `ExpiredSignature` once
+//! the ledger timestamp reaches `expiry` or the ledger sequence passes
+//! `valid_until_ledger`. The ledger bound means a leaked but unsubmitted
+//! signature stops being usable after a short window, so signers should pick
+//! a `valid_until_ledger` only a few hundred ledgers ahead (e.g. ~720 ledgers
+//! ≈ 1 hour at ~5s/ledger). Use this path when the admin key is kept
 //! offline or in cold storage and a relayer pays the fees; use the direct
 //! path (`admin.require_auth()`) whenever the admin can sign the transaction
 //! itself.
@@ -97,6 +109,11 @@ enum DataKey {
     /// Last accepted delegated-action nonce for an admin. Persistent storage.
     DelegatedNonce(Address),
     PendingUpgrade,
+    /// Marks an address as frozen. Independent of `Allowed`, so freezing and
+    /// unfreezing never touches allowlist status or history. Persistent storage.
+    Frozen(Address),
+    /// When `true`, `clawback` only succeeds against a frozen address. Instance storage.
+    ClawbackRequiresFreeze,
 }
 
 #[contracttype]
@@ -115,6 +132,34 @@ pub struct AllowAdd {
 pub struct AllowRemove {
     #[topic]
     pub address: Address,
+}
+
+/// Emitted when an admin or compliance officer freezes `address`.
+#[contractevent]
+pub struct AddressFrozen {
+    #[topic]
+    pub caller: Address,
+    #[topic]
+    pub address: Address,
+}
+
+/// Emitted when an admin or compliance officer unfreezes `address`.
+#[contractevent]
+pub struct AddressUnfrozen {
+    #[topic]
+    pub caller: Address,
+    #[topic]
+    pub address: Address,
+}
+
+/// Emitted when the admin claws back `amount` of the underlying token from `from`.
+#[contractevent]
+pub struct Clawback {
+    #[topic]
+    pub admin: Address,
+    #[topic]
+    pub from: Address,
+    pub amount: i128,
 }
 
 #[contractevent]
@@ -246,6 +291,11 @@ pub enum Error {
     /// `commit_upgrade` called with no pending upgrade, or before `activated_at`.
     UpgradeNotReady = 12,
     BatchTooLarge = 13,
+    /// `transfer` involves an address that is currently frozen.
+    AddressFrozen = 14,
+    /// `clawback` was called against an address that is not frozen while
+    /// `clawback_requires_freeze` is enabled.
+    ClawbackRequiresFreeze = 15,
 }
 
 #[contract]
@@ -316,6 +366,14 @@ impl AllowlistToken {
         Ok(())
     }
 
+    /// Returns the ed25519 public key currently registered with
+    /// `set_delegated_admin_key`, or `None` if delegation is not configured.
+    pub fn get_delegated_admin_key(env: Env) -> Option<BytesN<32>> {
+        env.storage()
+            .instance()
+            .get(&DataKey::DelegatedAdminPubKey)
+    }
+
     /// Add `address` to the allowlist. Admin-only.
     ///
     /// Granting access is deliberately stricter than revoking it: putting an
@@ -382,8 +440,14 @@ impl AllowlistToken {
     }
 
     /// Add `address` to the allowlist using a signed off-chain authorization
-    /// payload. This path verifies a nonce and expiry before applying the
-    /// allowlist change, so a relayer can submit it on behalf of the admin.
+    /// payload. This path verifies a nonce, a timestamp `expiry` and a
+    /// `valid_until_ledger` bound before applying the allowlist change, so a
+    /// relayer can submit it on behalf of the admin.
+    ///
+    /// Returns `Err(ExpiredSignature)` if `expiry` is not after the current
+    /// ledger timestamp or the current ledger sequence is greater than
+    /// `valid_until_ledger`. Both values are part of the signed payload, so a
+    /// relayer cannot extend them.
     ///
     /// Returns `Err(ContractPaused)` if the contract is currently paused.
     pub fn add_to_allowlist_delegated(
@@ -392,6 +456,7 @@ impl AllowlistToken {
         address: Address,
         nonce: u64,
         expiry: u64,
+        valid_until_ledger: u32,
         signature: BytesN<64>,
     ) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
@@ -399,6 +464,9 @@ impl AllowlistToken {
 
         let now = env.ledger().timestamp();
         if expiry <= now {
+            return Err(Error::ExpiredSignature);
+        }
+        if env.ledger().sequence() > valid_until_ledger {
             return Err(Error::ExpiredSignature);
         }
 
@@ -417,7 +485,14 @@ impl AllowlistToken {
             .get(&DataKey::DelegatedAdminPubKey)
             .ok_or(Error::DelegationNotConfigured)?;
         let action = Symbol::new(&env, "add_to_allowlist");
-        let message = Self::delegated_action_message(&env, &address, &action, nonce, expiry);
+        let message = Self::delegated_action_message(
+            &env,
+            &address,
+            &action,
+            nonce,
+            expiry,
+            valid_until_ledger,
+        );
         match soroban_sdk::env::internal::Env::verify_sig_ed25519(
             &env,
             pubkey.to_object(),
@@ -475,6 +550,110 @@ impl AllowlistToken {
             AllowRemove { address }.publish(&env);
         }
         Ok(())
+    }
+
+    /// Freeze `address` so it can neither send nor receive the wrapped token.
+    /// Admin or compliance officer.
+    ///
+    /// Freezing is deliberately separate from allowlist removal: the
+    /// address keeps its allowlist entry (including any expiration ledger),
+    /// so an issuer can suspend a holder during an investigation and later
+    /// restore them with `unfreeze` without re-onboarding. Freezing an
+    /// already-frozen address is a no-op that still emits `AddressFrozen`.
+    ///
+    /// Returns `Err(ContractPaused)` if the contract is currently paused.
+    pub fn freeze(env: Env, caller: Address, address: Address) -> Result<(), Error> {
+        Self::reject_if_paused(&env)?;
+        Self::require_compliance_authority(&env, &caller)?;
+        let key = DataKey::Frozen(address.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            ALLOWED_TTL_THRESHOLD,
+            ALLOWED_TTL_EXTEND_TO,
+        );
+        AddressFrozen { caller, address }.publish(&env);
+        Ok(())
+    }
+
+    /// Lift a freeze placed by `freeze`. Admin or compliance officer.
+    ///
+    /// The address's allowlist status is untouched. Unfreezing an address
+    /// that is not frozen is a no-op that still emits `AddressUnfrozen`.
+    ///
+    /// Returns `Err(ContractPaused)` if the contract is currently paused.
+    pub fn unfreeze(env: Env, caller: Address, address: Address) -> Result<(), Error> {
+        Self::reject_if_paused(&env)?;
+        Self::require_compliance_authority(&env, &caller)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Frozen(address.clone()));
+        AddressUnfrozen { caller, address }.publish(&env);
+        Ok(())
+    }
+
+    /// Returns true if `address` is currently frozen.
+    ///
+    /// Not affected by pause state — reads always succeed.
+    pub fn is_frozen(env: Env, address: Address) -> bool {
+        Self::is_frozen_internal(&env, &address)
+    }
+
+    /// Claw back `amount` of the underlying token from `from`. Admin-only.
+    ///
+    /// Intended for court orders and error correction on real-world-asset
+    /// tokens. The call is forwarded to the underlying token's SEP-41
+    /// `clawback(from, amount)` (as exposed by the Stellar Asset Contract),
+    /// so this contract must be the underlying token's admin and the asset
+    /// must have clawback enabled.
+    ///
+    /// If `set_clawback_requires_freeze(admin, true)` has been called, `from`
+    /// must be frozen first (see `freeze`), otherwise the call fails with
+    /// `ClawbackRequiresFreeze`.
+    ///
+    /// Not blocked by pause, so legally mandated recoveries can still be
+    /// executed during an incident. `amount` must be positive.
+    ///
+    /// Emits `Clawback { admin, from, amount }`.
+    pub fn clawback(env: Env, admin: Address, from: Address, amount: i128) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if amount <= 0 {
+            return Err(Error::InvalidInput);
+        }
+        if Self::get_clawback_requires_freeze(env.clone()) && !Self::is_frozen_internal(&env, &from)
+        {
+            return Err(Error::ClawbackRequiresFreeze);
+        }
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(Error::NotInitialized)?;
+        token::StellarAssetClient::new(&env, &token_address).clawback(&from, &amount);
+        Clawback { admin, from, amount }.publish(&env);
+        Ok(())
+    }
+
+    /// Require (`true`) or stop requiring (`false`) that an address be frozen
+    /// before it can be clawed back. Admin-only. Defaults to `false`.
+    pub fn set_clawback_requires_freeze(
+        env: Env,
+        admin: Address,
+        required: bool,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::ClawbackRequiresFreeze, &required);
+        Ok(())
+    }
+
+    /// Returns whether `clawback` requires the target address to be frozen.
+    pub fn get_clawback_requires_freeze(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::ClawbackRequiresFreeze)
+            .unwrap_or(false)
     }
 
     /// Assign the compliance-officer role. Admin-only.
@@ -762,6 +941,8 @@ impl AllowlistToken {
 
     /// Transfer `amount` of the underlying token from `from` to `to`.
     ///
+    /// Returns `Err(AddressFrozen)` if either party is frozen (see `freeze`).
+    ///
     /// Returns `Ok(false)` without forwarding if either party is not
     /// allowlisted, emitting a `Blocked` event for auditability. Checking an
     /// existing allowlist entry extends its TTL when it falls below the
@@ -777,6 +958,10 @@ impl AllowlistToken {
         }
 
         from.require_auth();
+
+        if Self::is_frozen_internal(&env, &from) || Self::is_frozen_internal(&env, &to) {
+            return Err(Error::AddressFrozen);
+        }
 
         let from_allowed = Self::is_allowed_and_extend_ttl(&env, from.clone());
         let to_allowed = Self::is_allowed_and_extend_ttl(&env, to.clone());
@@ -825,6 +1010,31 @@ impl AllowlistToken {
         Ok(())
     }
 
+    /// Accept either the stored admin or the stored compliance officer.
+    fn require_compliance_authority(env: &Env, caller: &Address) -> Result<(), Error> {
+        caller.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if stored_admin == *caller {
+            return Ok(());
+        }
+        let officer: Option<Address> = env.storage().instance().get(&DataKey::ComplianceOfficer);
+        if officer.as_ref() == Some(caller) {
+            return Ok(());
+        }
+        Err(Error::NotAuthorized)
+    }
+
+    fn is_frozen_internal(env: &Env, address: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Frozen(address.clone()))
+            .unwrap_or(false)
+    }
+
     fn is_allowed_and_extend_ttl(env: &Env, address: Address) -> bool {
         let key = DataKey::Allowed(address);
         let allowed = env.storage().persistent().get(&key).unwrap_or(false);
@@ -851,16 +1061,17 @@ impl AllowlistToken {
     }
 
     /// Message signed by the delegated admin key:
-    /// `allowlist-delegated-v1:<target>:<action>:<nonce>:<expiry>`.
+    /// `allowlist-delegated-v2:<target>:<action>:<nonce>:<expiry>:<valid_until_ledger>`.
     fn delegated_action_message(
         env: &Env,
         target: &Address,
         action: &Symbol,
         nonce: u64,
         expiry: u64,
+        valid_until_ledger: u32,
     ) -> Bytes {
         let mut message = Bytes::new(env);
-        message.append(&Bytes::from_slice(env, b"allowlist-delegated-v1:"));
+        message.append(&Bytes::from_slice(env, b"allowlist-delegated-v2:"));
         let target_str = target.to_string().to_string();
         message.append(&Bytes::from_slice(env, target_str.as_bytes()));
         message.push_back(b':');
@@ -872,6 +1083,9 @@ impl AllowlistToken {
         message.push_back(b':');
         let expiry_str = alloc::format!("{expiry}");
         message.append(&Bytes::from_slice(env, expiry_str.as_bytes()));
+        message.push_back(b':');
+        let valid_until_str = alloc::format!("{valid_until_ledger}");
+        message.append(&Bytes::from_slice(env, valid_until_str.as_bytes()));
         message
     }
 }

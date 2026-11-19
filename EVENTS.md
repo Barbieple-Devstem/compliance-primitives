@@ -103,6 +103,51 @@ data   : {}
 |---|---|---|---|
 | `address` | `Address` | topic | Address removed from the allowlist |
 
+#### `AddressFrozen`
+
+Emitted when the admin or compliance officer calls `freeze(caller, address)`.
+Freezing does not touch the address's allowlist entry.
+
+```
+topics : ["address_frozen", <caller: Address>, <address: Address>]
+data   : {}
+```
+
+| Field | Type | Placement | Description |
+|---|---|---|---|
+| `caller` | `Address` | topic | Admin or compliance officer who froze the address |
+| `address` | `Address` | topic | Address that can no longer send or receive |
+
+#### `AddressUnfrozen`
+
+Emitted when the admin or compliance officer calls `unfreeze(caller, address)`.
+
+```
+topics : ["address_unfrozen", <caller: Address>, <address: Address>]
+data   : {}
+```
+
+| Field | Type | Placement | Description |
+|---|---|---|---|
+| `caller` | `Address` | topic | Admin or compliance officer who lifted the freeze |
+| `address` | `Address` | topic | Address whose freeze was lifted |
+
+#### `Clawback`
+
+Emitted when the admin calls `clawback(admin, from, amount)` and the
+underlying token's `clawback` succeeds.
+
+```
+topics : ["clawback", <admin: Address>, <from: Address>]
+data   : { "amount": <i128> }
+```
+
+| Field | Type | Placement | Description |
+|---|---|---|---|
+| `admin` | `Address` | topic | Admin who executed the clawback |
+| `from` | `Address` | topic | Address whose tokens were clawed back |
+| `amount` | `i128` | data | Amount of the underlying token clawed back |
+
 #### `Blocked`
 
 Emitted when a `transfer` call is rejected because at least one party is
