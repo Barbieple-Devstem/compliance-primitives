@@ -23,6 +23,9 @@
 //! Either role may also `freeze` / `unfreeze` an address: a frozen address
 //! can neither send nor receive, but keeps its allowlist entry, so a holder
 //! can be suspended during an investigation without losing their status.
+//! The admin may `clawback` underlying tokens from an address (forwarded to
+//! the underlying SEP-41 token's `clawback`), optionally only once that
+//! address has been frozen (`set_clawback_requires_freeze`).
 //!
 //! **Delegated actions**: `add_to_allowlist_delegated` lets a relayer submit
 //! an allowlist addition on the admin's behalf, without the admin account
@@ -96,6 +99,8 @@ enum DataKey {
     /// Marks an address as frozen. Independent of `Allowed`, so freezing and
     /// unfreezing never touches allowlist status or history. Persistent storage.
     Frozen(Address),
+    /// When `true`, `clawback` only succeeds against a frozen address. Instance storage.
+    ClawbackRequiresFreeze,
 }
 
 #[contracttype]
@@ -132,6 +137,16 @@ pub struct AddressUnfrozen {
     pub caller: Address,
     #[topic]
     pub address: Address,
+}
+
+/// Emitted when the admin claws back `amount` of the underlying token from `from`.
+#[contractevent]
+pub struct Clawback {
+    #[topic]
+    pub admin: Address,
+    #[topic]
+    pub from: Address,
+    pub amount: i128,
 }
 
 #[contractevent]
@@ -235,6 +250,9 @@ pub enum Error {
     BatchTooLarge = 13,
     /// `transfer` involves an address that is currently frozen.
     AddressFrozen = 14,
+    /// `clawback` was called against an address that is not frozen while
+    /// `clawback_requires_freeze` is enabled.
+    ClawbackRequiresFreeze = 15,
 }
 
 #[contract]
@@ -495,6 +513,63 @@ impl AllowlistToken {
     /// Not affected by pause state — reads always succeed.
     pub fn is_frozen(env: Env, address: Address) -> bool {
         Self::is_frozen_internal(&env, &address)
+    }
+
+    /// Claw back `amount` of the underlying token from `from`. Admin-only.
+    ///
+    /// Intended for court orders and error correction on real-world-asset
+    /// tokens. The call is forwarded to the underlying token's SEP-41
+    /// `clawback(from, amount)` (as exposed by the Stellar Asset Contract),
+    /// so this contract must be the underlying token's admin and the asset
+    /// must have clawback enabled.
+    ///
+    /// If `set_clawback_requires_freeze(admin, true)` has been called, `from`
+    /// must be frozen first (see `freeze`), otherwise the call fails with
+    /// `ClawbackRequiresFreeze`.
+    ///
+    /// Not blocked by pause, so legally mandated recoveries can still be
+    /// executed during an incident. `amount` must be positive.
+    ///
+    /// Emits `Clawback { admin, from, amount }`.
+    pub fn clawback(env: Env, admin: Address, from: Address, amount: i128) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        if amount <= 0 {
+            return Err(Error::InvalidInput);
+        }
+        if Self::get_clawback_requires_freeze(env.clone()) && !Self::is_frozen_internal(&env, &from)
+        {
+            return Err(Error::ClawbackRequiresFreeze);
+        }
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(Error::NotInitialized)?;
+        token::StellarAssetClient::new(&env, &token_address).clawback(&from, &amount);
+        Clawback { admin, from, amount }.publish(&env);
+        Ok(())
+    }
+
+    /// Require (`true`) or stop requiring (`false`) that an address be frozen
+    /// before it can be clawed back. Admin-only. Defaults to `false`.
+    pub fn set_clawback_requires_freeze(
+        env: Env,
+        admin: Address,
+        required: bool,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::ClawbackRequiresFreeze, &required);
+        Ok(())
+    }
+
+    /// Returns whether `clawback` requires the target address to be frozen.
+    pub fn get_clawback_requires_freeze(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::ClawbackRequiresFreeze)
+            .unwrap_or(false)
     }
 
     /// Assign the compliance-officer role. Admin-only.

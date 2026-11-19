@@ -132,6 +132,22 @@ data   : {}
 | `caller` | `Address` | topic | Admin or compliance officer who lifted the freeze |
 | `address` | `Address` | topic | Address whose freeze was lifted |
 
+#### `Clawback`
+
+Emitted when the admin calls `clawback(admin, from, amount)` and the
+underlying token's `clawback` succeeds.
+
+```
+topics : ["clawback", <admin: Address>, <from: Address>]
+data   : { "amount": <i128> }
+```
+
+| Field | Type | Placement | Description |
+|---|---|---|---|
+| `admin` | `Address` | topic | Admin who executed the clawback |
+| `from` | `Address` | topic | Address whose tokens were clawed back |
+| `amount` | `i128` | data | Amount of the underlying token clawed back |
+
 #### `Blocked`
 
 Emitted when a `transfer` call is rejected because at least one party is

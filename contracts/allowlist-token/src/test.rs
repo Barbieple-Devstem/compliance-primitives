@@ -22,6 +22,16 @@ impl MockToken {
     pub fn last_transfer(env: Env) -> Option<(Address, Address, i128)> {
         env.storage().instance().get(&Symbol::new(&env, "last"))
     }
+
+    pub fn clawback(env: Env, from: Address, amount: i128) {
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "clawback"), &(from, amount));
+    }
+
+    pub fn last_clawback(env: Env) -> Option<(Address, i128)> {
+        env.storage().instance().get(&Symbol::new(&env, "clawback"))
+    }
 }
 
 // ─── Setup helper ────────────────────────────────────────────────────────────
@@ -1172,4 +1182,126 @@ fn test_freeze_and_unfreeze_emit_events() {
         (Symbol::new(&env, "address_unfrozen"), admin, alice).into_val(&env)
     );
     assert_eq!(data, Map::<Symbol, Val>::new(&env).into_val(&env));
+}
+
+// ─── Clawback (#763) ─────────────────────────────────────────────────────────
+
+#[test]
+fn test_admin_clawback_forwards_to_underlying_token() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+
+    client.clawback(&admin, &alice, &25);
+    assert_eq!(
+        MockTokenClient::new(&env, &token_id).last_clawback(),
+        Some((alice, 25))
+    );
+}
+
+#[test]
+fn test_clawback_emits_event() {
+    let env = Env::default();
+    let (admin, _token_id, contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+
+    client.clawback(&admin, &alice, &25);
+
+    let events = env.events().all();
+    let (id, topics, data) = events.last().unwrap();
+    assert_eq!(id, contract_id);
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "clawback"), admin, alice).into_val(&env)
+    );
+    assert_eq!(
+        data,
+        Map::<Symbol, Val>::from_array(
+            &env,
+            [(Symbol::new(&env, "amount"), 25i128.into_val(&env))],
+        )
+        .into_val(&env)
+    );
+}
+
+#[test]
+fn test_clawback_rejects_non_admin() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let officer = Address::generate(&env);
+    let alice = Address::generate(&env);
+    client.set_compliance_officer(&admin, &officer);
+
+    assert_eq!(
+        client.try_clawback(&officer, &alice, &25),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(MockTokenClient::new(&env, &token_id).last_clawback(), None);
+}
+
+#[test]
+fn test_clawback_rejects_non_positive_amount() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+
+    assert_eq!(
+        client.try_clawback(&admin, &alice, &0),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        client.try_clawback(&admin, &alice, &-1),
+        Err(Ok(Error::InvalidInput))
+    );
+}
+
+#[test]
+fn test_clawback_requires_freeze_when_enabled() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+
+    assert!(!client.get_clawback_requires_freeze());
+    client.set_clawback_requires_freeze(&admin, &true);
+    assert!(client.get_clawback_requires_freeze());
+
+    assert_eq!(
+        client.try_clawback(&admin, &alice, &25),
+        Err(Ok(Error::ClawbackRequiresFreeze))
+    );
+    assert_eq!(MockTokenClient::new(&env, &token_id).last_clawback(), None);
+
+    client.freeze(&admin, &alice);
+    client.clawback(&admin, &alice, &25);
+    assert_eq!(
+        MockTokenClient::new(&env, &token_id).last_clawback(),
+        Some((alice, 25))
+    );
+}
+
+#[test]
+fn test_set_clawback_requires_freeze_rejects_non_admin() {
+    let env = Env::default();
+    let (_admin, _token_id, _contract_id, client) = setup(&env);
+    let stranger = Address::generate(&env);
+
+    assert_eq!(
+        client.try_set_clawback_requires_freeze(&stranger, &true),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert!(!client.get_clawback_requires_freeze());
+}
+
+#[test]
+fn test_clawback_allowed_while_paused() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    client.pause(&admin);
+
+    client.clawback(&admin, &alice, &5);
+    assert_eq!(
+        MockTokenClient::new(&env, &token_id).last_clawback(),
+        Some((alice, 5))
+    );
 }

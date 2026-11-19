@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **allowlist-token**: Admin-only `clawback(admin, from, amount)` forwarded
+  to the underlying SEP-41 token's `clawback`, emitting a `Clawback` event.
+  `set_clawback_requires_freeze` / `get_clawback_requires_freeze` optionally
+  require the target to be frozen first (`ClawbackRequiresFreeze`) (#763).
 - **allowlist-token**: `freeze(caller, address)` / `unfreeze(caller, address)`
   callable by the admin or compliance officer, plus an `is_frozen` view. A
   frozen address cannot send or receive (`transfer` returns
