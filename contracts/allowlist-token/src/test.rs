@@ -1592,3 +1592,33 @@ fn test_delegated_valid_until_ledger_is_bound_by_signature() {
     assert_eq!(result, Err(Ok(Error::NotAuthorized)));
     assert!(!client.is_allowed(&alice));
 }
+
+#[test]
+fn test_allowlist_count_tracks_only_real_state_changes() {
+    let env = Env::default();
+    let (admin, _token, _id, client) = setup(&env);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+
+    assert_eq!(client.allowlist_count(), 0);
+
+    client.add_to_allowlist(&admin, &a, &None);
+    assert_eq!(client.allowlist_count(), 1);
+
+    // Re-adding an existing address only changes its expiration.
+    client.add_to_allowlist(&admin, &a, &Some(env.ledger().sequence() + 100));
+    assert_eq!(client.allowlist_count(), 1);
+
+    client.add_multiple_to_allowlist(&admin, &vec![&env, a.clone(), b.clone()], &None);
+    assert_eq!(client.allowlist_count(), 2);
+
+    client.remove_from_allowlist(&admin, &b);
+    assert_eq!(client.allowlist_count(), 1);
+
+    // Removing an address that is not listed is a no-op.
+    client.remove_from_allowlist(&admin, &b);
+    assert_eq!(client.allowlist_count(), 1);
+
+    client.remove_multiple_from_allowlist(&admin, &vec![&env, a.clone(), b.clone()]);
+    assert_eq!(client.allowlist_count(), 0);
+}

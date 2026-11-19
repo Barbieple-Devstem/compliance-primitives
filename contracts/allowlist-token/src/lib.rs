@@ -114,6 +114,8 @@ enum DataKey {
     Frozen(Address),
     /// When `true`, `clawback` only succeeds against a frozen address. Instance storage.
     ClawbackRequiresFreeze,
+    /// Number of addresses currently holding an allowlist entry. Instance storage.
+    AllowlistCount,
 }
 
 #[contracttype]
@@ -393,15 +395,7 @@ impl AllowlistToken {
                 return Err(Error::InvalidInput);
             }
         }
-        let key = DataKey::Allowed(address.clone());
-        env.storage()
-            .persistent()
-            .set(&key, &AllowlistEntry { expiration_ledger });
-        env.storage().persistent().extend_ttl(
-            &key,
-            ALLOWED_TTL_THRESHOLD,
-            ALLOWED_TTL_EXTEND_TO,
-        );
+        Self::store_allowlist_entry(&env, &address, AllowlistEntry { expiration_ledger });
         AllowAdd { address }.publish(&env);
         Ok(())
     }
@@ -425,15 +419,7 @@ impl AllowlistToken {
         }
 
         for address in addresses.iter() {
-            let key = DataKey::Allowed(address.clone());
-            env.storage()
-                .persistent()
-                .set(&key, &AllowlistEntry { expiration_ledger });
-            env.storage().persistent().extend_ttl(
-                &key,
-                ALLOWED_TTL_THRESHOLD,
-                ALLOWED_TTL_EXTEND_TO,
-            );
+            Self::store_allowlist_entry(&env, &address, AllowlistEntry { expiration_ledger });
             AllowAdd { address }.publish(&env);
         }
         Ok(())
@@ -502,15 +488,7 @@ impl AllowlistToken {
             Ok(_) => {}
             Err(_) => return Err(Error::NotAuthorized),
         }
-        let key = DataKey::Allowed(address.clone());
-        env.storage()
-            .persistent()
-            .set(&key, &AllowlistEntry { expiration_ledger: None });
-        env.storage().persistent().extend_ttl(
-            &key,
-            ALLOWED_TTL_THRESHOLD,
-            ALLOWED_TTL_EXTEND_TO,
-        );
+        Self::store_allowlist_entry(&env, &address, AllowlistEntry { expiration_ledger: None });
         AllowAdd { address }.publish(&env);
         Ok(())
     }
@@ -521,9 +499,7 @@ impl AllowlistToken {
     pub fn remove_from_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
         Self::require_compliance_authority(&env, &admin)?;
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Allowed(address.clone()));
+        Self::remove_allowlist_entry(&env, &address);
         AllowRemove { address }.publish(&env);
         Ok(())
     }
@@ -544,9 +520,7 @@ impl AllowlistToken {
         }
 
         for address in addresses.iter() {
-            env.storage()
-                .persistent()
-                .remove(&DataKey::Allowed(address.clone()));
+            Self::remove_allowlist_entry(&env, &address);
             AllowRemove { address }.publish(&env);
         }
         Ok(())
@@ -883,6 +857,21 @@ impl AllowlistToken {
         env.storage().persistent().get(&DataKey::Allowed(address))
     }
 
+    /// Number of addresses that currently hold an allowlist entry.
+    ///
+    /// Maintained incrementally: it changes only when an add creates a new
+    /// entry or a remove deletes an existing one. Re-adding an address (for
+    /// example to change its expiration) and removing an address that is not
+    /// listed leave it unchanged. Like `get_allowlist_entry`, it counts stored
+    /// entries whether or not they have expired; use `is_allowed` for the
+    /// effective status of one address.
+    pub fn allowlist_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AllowlistCount)
+            .unwrap_or(0)
+    }
+
     /// Unified compliance check — returns `true` if `address` is on the
     /// allowlist, identical to calling [`is_allowed`].
     ///
@@ -1026,6 +1015,43 @@ impl AllowlistToken {
             return Ok(());
         }
         Err(Error::NotAuthorized)
+    }
+
+    /// Stores `entry` for `address` and extends its TTL. `AllowlistCount` is
+    /// incremented only when the address had no stored entry before, so
+    /// updating an existing entry leaves the count unchanged.
+    fn store_allowlist_entry(env: &Env, address: &Address, entry: AllowlistEntry) {
+        let key = DataKey::Allowed(address.clone());
+        let is_new = !env.storage().persistent().has(&key);
+        env.storage().persistent().set(&key, &entry);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, ALLOWED_TTL_THRESHOLD, ALLOWED_TTL_EXTEND_TO);
+        if is_new {
+            Self::adjust_allowlist_count(env, 1);
+        }
+    }
+
+    /// Deletes `address`'s allowlist entry. `AllowlistCount` is decremented
+    /// only when an entry was actually present.
+    fn remove_allowlist_entry(env: &Env, address: &Address) {
+        let key = DataKey::Allowed(address.clone());
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().remove(&key);
+            Self::adjust_allowlist_count(env, -1);
+        }
+    }
+
+    fn adjust_allowlist_count(env: &Env, delta: i64) {
+        let current: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AllowlistCount)
+            .unwrap_or(0);
+        let updated = (i64::from(current) + delta).max(0) as u32;
+        env.storage()
+            .instance()
+            .set(&DataKey::AllowlistCount, &updated);
     }
 
     fn is_frozen_internal(env: &Env, address: &Address) -> bool {
