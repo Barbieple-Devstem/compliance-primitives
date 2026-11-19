@@ -1653,3 +1653,178 @@ fn test_is_allowed_batch_rejects_batches_over_limit() {
         Err(Ok(Error::BatchTooLarge))
     );
 }
+
+// ─── Merkle allowlist helpers ────────────────────────────────────────────────
+
+/// Mirrors the leaf encoding documented in `docs/allowlist-merkle-root.md`.
+fn merkle_leaf(env: &Env, address: &Address) -> BytesN<32> {
+    let address_str = address.to_string().to_string();
+    let mut preimage = Bytes::from_slice(env, &[0x00]);
+    preimage.append(&Bytes::from_slice(env, address_str.as_bytes()));
+    env.crypto().sha256(&preimage).to_bytes()
+}
+
+/// Mirrors the sorted-pair node encoding documented in `docs/allowlist-merkle-root.md`.
+fn merkle_node(env: &Env, a: &BytesN<32>, b: &BytesN<32>) -> BytesN<32> {
+    let (lo, hi) = if a.to_array() <= b.to_array() {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let mut preimage = Bytes::from_slice(env, &[0x01]);
+    preimage.append(&Bytes::from_slice(env, &lo.to_array()));
+    preimage.append(&Bytes::from_slice(env, &hi.to_array()));
+    env.crypto().sha256(&preimage).to_bytes()
+}
+
+/// Builds a four-holder tree and returns its root, the holders, and each
+/// holder's two-level proof.
+fn build_four_leaf_tree(
+    env: &Env,
+) -> (BytesN<32>, [Address; 4], [Vec<BytesN<32>>; 4]) {
+    let holders = [
+        Address::generate(env),
+        Address::generate(env),
+        Address::generate(env),
+        Address::generate(env),
+    ];
+    let l0 = merkle_leaf(env, &holders[0]);
+    let l1 = merkle_leaf(env, &holders[1]);
+    let l2 = merkle_leaf(env, &holders[2]);
+    let l3 = merkle_leaf(env, &holders[3]);
+    let n01 = merkle_node(env, &l0, &l1);
+    let n23 = merkle_node(env, &l2, &l3);
+    let root = merkle_node(env, &n01, &n23);
+    let proofs = [
+        vec![env, l1.clone(), n23.clone()],
+        vec![env, l0.clone(), n23.clone()],
+        vec![env, l3.clone(), n01.clone()],
+        vec![env, l2.clone(), n01.clone()],
+    ];
+    (root, holders, proofs)
+}
+
+#[test]
+fn test_merkle_proof_rejected_before_root_is_set() {
+    let env = Env::default();
+    let (_admin, _token_id, _contract_id, client) = setup(&env);
+    let (_root, holders, proofs) = build_four_leaf_tree(&env);
+
+    assert_eq!(client.get_allowlist_root(), None);
+    assert!(!client.is_allowed_with_proof(&holders[0], &proofs[0]));
+}
+
+#[test]
+fn test_merkle_proof_accepts_members_and_rejects_others() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let (root, holders, proofs) = build_four_leaf_tree(&env);
+    client.set_allowlist_root(&admin, &root);
+    assert_eq!(client.get_allowlist_root(), Some(root.clone()));
+
+    for i in 0..4 {
+        assert!(client.is_allowed_with_proof(&holders[i], &proofs[i]));
+    }
+
+    // A valid proof for one holder does not verify another holder.
+    assert!(!client.is_allowed_with_proof(&holders[0], &proofs[1]));
+
+    // An outsider cannot reuse a member's proof.
+    let outsider = Address::generate(&env);
+    assert!(!client.is_allowed_with_proof(&outsider, &proofs[0]));
+
+    // Proofs longer than the cap are rejected without hashing.
+    let mut too_long = Vec::new(&env);
+    for _ in 0..=MAX_MERKLE_PROOF_LEN {
+        too_long.push_back(BytesN::from_array(&env, &[0u8; 32]));
+    }
+    assert!(!client.is_allowed_with_proof(&holders[0], &too_long));
+}
+
+#[test]
+fn test_set_allowlist_root_is_admin_only_and_blocked_while_paused() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let (root, _holders, _proofs) = build_four_leaf_tree(&env);
+    let attacker = Address::generate(&env);
+
+    assert_eq!(
+        client.try_set_allowlist_root(&attacker, &root),
+        Err(Ok(Error::NotAuthorized))
+    );
+
+    client.pause(&admin);
+    assert_eq!(
+        client.try_set_allowlist_root(&admin, &root),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn test_transfer_with_proof_forwards_only_when_both_proofs_verify() {
+    let env = Env::default();
+    let (admin, token_id, _contract_id, client) = setup(&env);
+    let (root, holders, proofs) = build_four_leaf_tree(&env);
+    client.set_allowlist_root(&admin, &root);
+    let token = MockTokenClient::new(&env, &token_id);
+
+    // Both parties prove membership: the transfer is forwarded.
+    assert!(client.transfer_with_proof(
+        &holders[0],
+        &holders[2],
+        &50,
+        &proofs[0],
+        &proofs[2],
+    ));
+    assert_eq!(
+        token.last_transfer(),
+        Some((holders[0].clone(), holders[2].clone(), 50))
+    );
+
+    // Recipient proof is missing: the transfer is blocked and nothing is forwarded.
+    let outsider = Address::generate(&env);
+    assert!(!client.transfer_with_proof(
+        &holders[0],
+        &outsider,
+        &60,
+        &proofs[0],
+        &proofs[0],
+    ));
+    assert_eq!(
+        token.last_transfer(),
+        Some((holders[0].clone(), holders[2].clone(), 50))
+    );
+}
+
+#[test]
+fn test_transfer_with_proof_respects_freeze_and_pause() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+    let (root, holders, proofs) = build_four_leaf_tree(&env);
+    client.set_allowlist_root(&admin, &root);
+
+    client.freeze(&admin, &holders[1]);
+    assert_eq!(
+        client.try_transfer_with_proof(
+            &holders[0],
+            &holders[1],
+            &10,
+            &proofs[0],
+            &proofs[1],
+        ),
+        Err(Ok(Error::AddressFrozen))
+    );
+    client.unfreeze(&admin, &holders[1]);
+
+    client.pause(&admin);
+    assert_eq!(
+        client.try_transfer_with_proof(
+            &holders[0],
+            &holders[1],
+            &10,
+            &proofs[0],
+            &proofs[1],
+        ),
+        Err(Ok(Error::ContractPaused))
+    );
+}

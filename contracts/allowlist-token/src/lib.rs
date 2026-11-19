@@ -86,6 +86,10 @@ pub(crate) const ALLOWED_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
 /// Maximum number of addresses accepted by a batch allowlist operation.
 pub const MAX_BATCH_SIZE: u32 = 45;
 
+/// Maximum number of sibling hashes accepted in a Merkle allowlist proof.
+/// 32 levels covers 2^32 holders and bounds the hashing cost of one check.
+pub const MAX_MERKLE_PROOF_LEN: u32 = 32;
+
 /// Instance-storage TTL policy: whenever the remaining instance TTL drops
 /// below [`INSTANCE_TTL_THRESHOLD`], it is bumped back up to
 /// [`INSTANCE_TTL_EXTEND_TO`]. Matches `compliance-aggregator`.
@@ -116,6 +120,8 @@ enum DataKey {
     ClawbackRequiresFreeze,
     /// Number of addresses currently holding an allowlist entry. Instance storage.
     AllowlistCount,
+    /// Merkle root of the proof-based allowlist. Instance storage.
+    AllowlistRoot,
 }
 
 #[contracttype]
@@ -238,6 +244,14 @@ pub struct DelegatedAdminKeySet {
     pub admin: Address,
     pub previous: Option<BytesN<32>>,
     pub pubkey: BytesN<32>,
+}
+
+/// Emitted when `set_allowlist_root` publishes a new proof-mode allowlist root.
+#[contractevent]
+pub struct AllowlistRootSet {
+    #[topic]
+    pub admin: Address,
+    pub root: BytesN<32>,
 }
 
 #[contractevent]
@@ -890,6 +904,84 @@ impl AllowlistToken {
             .unwrap_or(0)
     }
 
+    /// Publish the Merkle root of the proof-based allowlist. Admin-only.
+    ///
+    /// Proof mode lets an issuer authorize a large holder set with one
+    /// on-chain value. Holders prove membership with [`is_allowed_with_proof`]
+    /// or [`transfer_with_proof`]. The root must be built with the leaf and
+    /// node encoding in `docs/allowlist-merkle-root.md`.
+    ///
+    /// Proof mode has no per-address expiration and no per-address revocation:
+    /// to remove a holder, publish a new root that omits them. Replacing the
+    /// root does not touch on-chain entries used by `is_allowed` / `transfer`.
+    ///
+    /// Returns `Err(ContractPaused)` if the contract is paused.
+    /// Emits `AllowlistRootSet { admin, root }`.
+    pub fn set_allowlist_root(env: Env, admin: Address, root: BytesN<32>) -> Result<(), Error> {
+        Self::reject_if_paused(&env)?;
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::AllowlistRoot, &root);
+        AllowlistRootSet { admin, root }.publish(&env);
+        Ok(())
+    }
+
+    /// Returns the current proof-mode allowlist root, if one has been set.
+    pub fn get_allowlist_root(env: Env) -> Option<BytesN<32>> {
+        env.storage().instance().get(&DataKey::AllowlistRoot)
+    }
+
+    /// Returns true if `proof` shows that `address` is a leaf under the
+    /// current allowlist root.
+    ///
+    /// Returns false when no root is set, when `proof` has more than
+    /// [`MAX_MERKLE_PROOF_LEN`] entries, or when the proof does not rebuild
+    /// the root. Not affected by pause state, and does not check freeze
+    /// status (see `is_frozen`).
+    pub fn is_allowed_with_proof(env: Env, address: Address, proof: Vec<BytesN<32>>) -> bool {
+        Self::verify_allowlist_proof(&env, &address, &proof)
+    }
+
+    /// Proof-mode counterpart of [`transfer`]. Each party proves membership
+    /// under the current root instead of using the on-chain allowlist.
+    ///
+    /// Returns `Err(ContractPaused)` if the contract is paused, and
+    /// `Err(AddressFrozen)` if either party is frozen. Returns `Ok(false)`
+    /// without forwarding if either proof fails, emitting `Blocked`. Otherwise
+    /// forwards the transfer to the underlying token and returns `Ok(true)`.
+    pub fn transfer_with_proof(
+        env: Env,
+        from: Address,
+        to: Address,
+        amount: i128,
+        from_proof: Vec<BytesN<32>>,
+        to_proof: Vec<BytesN<32>>,
+    ) -> Result<bool, Error> {
+        Self::extend_instance_ttl(&env);
+        if amount < 0 {
+            return Err(Error::InvalidInput);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(Error::ContractPaused);
+        }
+        from.require_auth();
+        if Self::is_frozen_internal(&env, &from) || Self::is_frozen_internal(&env, &to) {
+            return Err(Error::AddressFrozen);
+        }
+        if !Self::verify_allowlist_proof(&env, &from, &from_proof)
+            || !Self::verify_allowlist_proof(&env, &to, &to_proof)
+        {
+            Blocked { from, to, amount }.publish(&env);
+            return Ok(false);
+        }
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Token)
+            .ok_or(Error::NotInitialized)?;
+        token::Client::new(&env, &token_address).transfer(&from, &to, &amount);
+        Ok(true)
+    }
+
     /// Unified compliance check — returns `true` if `address` is on the
     /// allowlist, identical to calling [`is_allowed`].
     ///
@@ -1070,6 +1162,46 @@ impl AllowlistToken {
         env.storage()
             .instance()
             .set(&DataKey::AllowlistCount, &updated);
+    }
+
+    /// Rebuilds the root from `address`'s leaf and the supplied siblings and
+    /// compares it with the stored root.
+    fn verify_allowlist_proof(env: &Env, address: &Address, proof: &Vec<BytesN<32>>) -> bool {
+        let root: BytesN<32> = match env.storage().instance().get(&DataKey::AllowlistRoot) {
+            Some(root) => root,
+            None => return false,
+        };
+        if proof.len() > MAX_MERKLE_PROOF_LEN {
+            return false;
+        }
+        let mut node = Self::merkle_leaf_hash(env, address);
+        for sibling in proof.iter() {
+            node = Self::merkle_node_hash(env, &node, &sibling);
+        }
+        node == root
+    }
+
+    /// Leaf hash: `sha256(0x00 || address_strkey)`. The `0x00` prefix keeps
+    /// leaves and internal nodes in separate domains.
+    fn merkle_leaf_hash(env: &Env, address: &Address) -> BytesN<32> {
+        let address_str = address.to_string().to_string();
+        let mut preimage = Bytes::from_slice(env, &[0x00]);
+        preimage.append(&Bytes::from_slice(env, address_str.as_bytes()));
+        env.crypto().sha256(&preimage).to_bytes()
+    }
+
+    /// Internal node hash: `sha256(0x01 || min(a, b) || max(a, b))`. Sorting
+    /// the pair makes proofs independent of left/right position.
+    fn merkle_node_hash(env: &Env, a: &BytesN<32>, b: &BytesN<32>) -> BytesN<32> {
+        let (lo, hi) = if a.to_array() <= b.to_array() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let mut preimage = Bytes::from_slice(env, &[0x01]);
+        preimage.append(&Bytes::from_slice(env, &lo.to_array()));
+        preimage.append(&Bytes::from_slice(env, &hi.to_array()));
+        env.crypto().sha256(&preimage).to_bytes()
     }
 
     fn is_frozen_internal(env: &Env, address: &Address) -> bool {
