@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **allowlist-token**: `freeze(caller, address)` / `unfreeze(caller, address)`
+  callable by the admin or compliance officer, plus an `is_frozen` view. A
+  frozen address cannot send or receive (`transfer` returns
+  `AddressFrozen`) but keeps its allowlist entry. Emits `AddressFrozen` /
+  `AddressUnfrozen` events (#762).
 - **circuit-breaker**: Guardian set for faster incident response. Admin-managed
   `add_guardian` / `remove_guardian` / `is_guardian`; guardians can call
   `freeze`, while `unfreeze` remains admin-only. `Frozen` event topic renamed

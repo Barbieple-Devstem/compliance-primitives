@@ -20,6 +20,9 @@
 //! compliance officer, assigned with `set_compliance_officer` and removed
 //! with `revoke_compliance_officer` (both admin-only), may call
 //! `remove_from_allowlist` but can never grant access or manage roles.
+//! Either role may also `freeze` / `unfreeze` an address: a frozen address
+//! can neither send nor receive, but keeps its allowlist entry, so a holder
+//! can be suspended during an investigation without losing their status.
 //!
 //! **Delegated actions**: `add_to_allowlist_delegated` lets a relayer submit
 //! an allowlist addition on the admin's behalf, without the admin account
@@ -90,6 +93,9 @@ enum DataKey {
     /// Last accepted delegated-action nonce for an admin. Persistent storage.
     DelegatedNonce(Address),
     PendingUpgrade,
+    /// Marks an address as frozen. Independent of `Allowed`, so freezing and
+    /// unfreezing never touches allowlist status or history. Persistent storage.
+    Frozen(Address),
 }
 
 #[contracttype]
@@ -106,6 +112,24 @@ pub struct AllowAdd {
 
 #[contractevent]
 pub struct AllowRemove {
+    #[topic]
+    pub address: Address,
+}
+
+/// Emitted when an admin or compliance officer freezes `address`.
+#[contractevent]
+pub struct AddressFrozen {
+    #[topic]
+    pub caller: Address,
+    #[topic]
+    pub address: Address,
+}
+
+/// Emitted when an admin or compliance officer unfreezes `address`.
+#[contractevent]
+pub struct AddressUnfrozen {
+    #[topic]
+    pub caller: Address,
     #[topic]
     pub address: Address,
 }
@@ -209,6 +233,8 @@ pub enum Error {
     /// `commit_upgrade` called with no pending upgrade, or before `activated_at`.
     UpgradeNotReady = 12,
     BatchTooLarge = 13,
+    /// `transfer` involves an address that is currently frozen.
+    AddressFrozen = 14,
 }
 
 #[contract]
@@ -422,6 +448,53 @@ impl AllowlistToken {
             AllowRemove { address }.publish(&env);
         }
         Ok(())
+    }
+
+    /// Freeze `address` so it can neither send nor receive the wrapped token.
+    /// Admin or compliance officer.
+    ///
+    /// Freezing is deliberately separate from allowlist removal: the
+    /// address keeps its allowlist entry (including any expiration ledger),
+    /// so an issuer can suspend a holder during an investigation and later
+    /// restore them with `unfreeze` without re-onboarding. Freezing an
+    /// already-frozen address is a no-op that still emits `AddressFrozen`.
+    ///
+    /// Returns `Err(ContractPaused)` if the contract is currently paused.
+    pub fn freeze(env: Env, caller: Address, address: Address) -> Result<(), Error> {
+        Self::reject_if_paused(&env)?;
+        Self::require_compliance_authority(&env, &caller)?;
+        let key = DataKey::Frozen(address.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage().persistent().extend_ttl(
+            &key,
+            ALLOWED_TTL_THRESHOLD,
+            ALLOWED_TTL_EXTEND_TO,
+        );
+        AddressFrozen { caller, address }.publish(&env);
+        Ok(())
+    }
+
+    /// Lift a freeze placed by `freeze`. Admin or compliance officer.
+    ///
+    /// The address's allowlist status is untouched. Unfreezing an address
+    /// that is not frozen is a no-op that still emits `AddressUnfrozen`.
+    ///
+    /// Returns `Err(ContractPaused)` if the contract is currently paused.
+    pub fn unfreeze(env: Env, caller: Address, address: Address) -> Result<(), Error> {
+        Self::reject_if_paused(&env)?;
+        Self::require_compliance_authority(&env, &caller)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Frozen(address.clone()));
+        AddressUnfrozen { caller, address }.publish(&env);
+        Ok(())
+    }
+
+    /// Returns true if `address` is currently frozen.
+    ///
+    /// Not affected by pause state — reads always succeed.
+    pub fn is_frozen(env: Env, address: Address) -> bool {
+        Self::is_frozen_internal(&env, &address)
     }
 
     /// Assign the compliance-officer role. Admin-only.
@@ -687,6 +760,8 @@ impl AllowlistToken {
 
     /// Transfer `amount` of the underlying token from `from` to `to`.
     ///
+    /// Returns `Err(AddressFrozen)` if either party is frozen (see `freeze`).
+    ///
     /// Returns `Ok(false)` without forwarding if either party is not
     /// allowlisted, emitting a `Blocked` event for auditability. Checking an
     /// existing allowlist entry extends its TTL when it falls below the
@@ -701,6 +776,10 @@ impl AllowlistToken {
         }
 
         from.require_auth();
+
+        if Self::is_frozen_internal(&env, &from) || Self::is_frozen_internal(&env, &to) {
+            return Err(Error::AddressFrozen);
+        }
 
         let from_allowed = Self::is_allowed_and_extend_ttl(&env, from.clone());
         let to_allowed = Self::is_allowed_and_extend_ttl(&env, to.clone());
@@ -738,6 +817,31 @@ impl AllowlistToken {
             return Err(Error::NotAuthorized);
         }
         Ok(())
+    }
+
+    /// Accept either the stored admin or the stored compliance officer.
+    fn require_compliance_authority(env: &Env, caller: &Address) -> Result<(), Error> {
+        caller.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if stored_admin == *caller {
+            return Ok(());
+        }
+        let officer: Option<Address> = env.storage().instance().get(&DataKey::ComplianceOfficer);
+        if officer.as_ref() == Some(caller) {
+            return Ok(());
+        }
+        Err(Error::NotAuthorized)
+    }
+
+    fn is_frozen_internal(env: &Env, address: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Frozen(address.clone()))
+            .unwrap_or(false)
     }
 
     fn is_allowed_and_extend_ttl(env: &Env, address: Address) -> bool {

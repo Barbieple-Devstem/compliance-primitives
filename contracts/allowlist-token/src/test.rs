@@ -1017,3 +1017,159 @@ fn test_upgrade_cancel_event_includes_admin() {
     assert_eq!(data, Map::<Symbol, Val>::new(&env).into_val(&env));
     assert_eq!(events.last().unwrap().0, contract_id);
 }
+
+// ─── Address freeze (#762) ───────────────────────────────────────────────────
+
+fn setup_allowlisted_pair(
+    env: &Env,
+) -> (Address, Address, Address, Address, AllowlistTokenClient<'_>) {
+    let (admin, token_id, _contract_id, client) = setup(env);
+    let alice = Address::generate(env);
+    let bob = Address::generate(env);
+    client.add_to_allowlist(&admin, &alice, &None);
+    client.add_to_allowlist(&admin, &bob, &None);
+    (admin, token_id, alice, bob, client)
+}
+
+#[test]
+fn test_freeze_keeps_allowlist_status() {
+    let env = Env::default();
+    let (admin, _token_id, alice, _bob, client) = setup_allowlisted_pair(&env);
+
+    assert!(!client.is_frozen(&alice));
+    client.freeze(&admin, &alice);
+    assert!(client.is_frozen(&alice));
+    assert!(client.is_allowed(&alice));
+
+    client.unfreeze(&admin, &alice);
+    assert!(!client.is_frozen(&alice));
+    assert!(client.is_allowed(&alice));
+}
+
+#[test]
+fn test_frozen_sender_cannot_transfer() {
+    let env = Env::default();
+    let (admin, token_id, alice, bob, client) = setup_allowlisted_pair(&env);
+
+    client.freeze(&admin, &alice);
+    assert_eq!(
+        client.try_transfer(&alice, &bob, &10),
+        Err(Ok(Error::AddressFrozen))
+    );
+    assert_eq!(MockTokenClient::new(&env, &token_id).last_transfer(), None);
+}
+
+#[test]
+fn test_frozen_recipient_cannot_receive() {
+    let env = Env::default();
+    let (admin, token_id, alice, bob, client) = setup_allowlisted_pair(&env);
+
+    client.freeze(&admin, &bob);
+    assert_eq!(
+        client.try_transfer(&alice, &bob, &10),
+        Err(Ok(Error::AddressFrozen))
+    );
+    assert_eq!(MockTokenClient::new(&env, &token_id).last_transfer(), None);
+}
+
+#[test]
+fn test_unfreeze_restores_transfers() {
+    let env = Env::default();
+    let (admin, token_id, alice, bob, client) = setup_allowlisted_pair(&env);
+
+    client.freeze(&admin, &alice);
+    client.unfreeze(&admin, &alice);
+
+    assert!(client.transfer(&alice, &bob, &10));
+    assert_eq!(
+        MockTokenClient::new(&env, &token_id).last_transfer(),
+        Some((alice, bob, 10))
+    );
+}
+
+#[test]
+fn test_officer_can_freeze_and_unfreeze() {
+    let env = Env::default();
+    let (admin, _token_id, alice, _bob, client) = setup_allowlisted_pair(&env);
+    let officer = Address::generate(&env);
+    client.set_compliance_officer(&admin, &officer);
+
+    client.freeze(&officer, &alice);
+    assert!(client.is_frozen(&alice));
+    client.unfreeze(&officer, &alice);
+    assert!(!client.is_frozen(&alice));
+}
+
+#[test]
+fn test_freeze_rejects_unauthorized_caller() {
+    let env = Env::default();
+    let (_admin, _token_id, alice, _bob, client) = setup_allowlisted_pair(&env);
+    let stranger = Address::generate(&env);
+
+    assert_eq!(
+        client.try_freeze(&stranger, &alice),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        client.try_unfreeze(&stranger, &alice),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert!(!client.is_frozen(&alice));
+}
+
+#[test]
+fn test_revoked_officer_cannot_freeze() {
+    let env = Env::default();
+    let (admin, _token_id, alice, _bob, client) = setup_allowlisted_pair(&env);
+    let officer = Address::generate(&env);
+    client.set_compliance_officer(&admin, &officer);
+    client.revoke_compliance_officer(&admin);
+
+    assert_eq!(
+        client.try_freeze(&officer, &alice),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn test_freeze_blocked_while_paused() {
+    let env = Env::default();
+    let (admin, _token_id, alice, _bob, client) = setup_allowlisted_pair(&env);
+    client.pause(&admin);
+
+    assert_eq!(
+        client.try_freeze(&admin, &alice),
+        Err(Ok(Error::ContractPaused))
+    );
+    assert_eq!(
+        client.try_unfreeze(&admin, &alice),
+        Err(Ok(Error::ContractPaused))
+    );
+}
+
+#[test]
+fn test_freeze_and_unfreeze_emit_events() {
+    let env = Env::default();
+    let (admin, _token_id, contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+
+    client.freeze(&admin, &alice);
+    let events = env.events().all();
+    let (id, topics, data) = events.last().unwrap();
+    assert_eq!(id, contract_id);
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "address_frozen"), admin.clone(), alice.clone()).into_val(&env)
+    );
+    assert_eq!(data, Map::<Symbol, Val>::new(&env).into_val(&env));
+
+    client.unfreeze(&admin, &alice);
+    let events = env.events().all();
+    let (id, topics, data) = events.last().unwrap();
+    assert_eq!(id, contract_id);
+    assert_eq!(
+        topics,
+        (Symbol::new(&env, "address_unfrozen"), admin, alice).into_val(&env)
+    );
+    assert_eq!(data, Map::<Symbol, Val>::new(&env).into_val(&env));
+}
