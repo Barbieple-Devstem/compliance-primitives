@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **allowlist-token** (breaking): `add_to_allowlist_delegated` takes a new
+  `valid_until_ledger: u32` argument, and the signed payload is now
+  `allowlist-delegated-v2:<target>:add_to_allowlist:<nonce>:<expiry>:<valid_until_ledger>`.
+  Calls submitted after `valid_until_ledger` are rejected with
+  `ExpiredSignature`, so a leaked unsubmitted signature can no longer be
+  used indefinitely. Signers must move to the v2 payload; v1 signatures are
+  no longer accepted (#765).
+
 ### Fixed
 
 - **allowlist-token**: `pause` now blocks `add_to_allowlist`,

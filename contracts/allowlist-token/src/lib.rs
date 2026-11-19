@@ -32,13 +32,19 @@
 //! signing the transaction. The admin first registers an ed25519 public key
 //! with `set_delegated_admin_key`. The holder of the matching private key then
 //! signs the payload
-//! `allowlist-delegated-v1:<target>:add_to_allowlist:<nonce>:<expiry>`, where
-//! `<target>` is the address being allowlisted, `<nonce>` is a `u64` and
-//! `<expiry>` is a ledger timestamp in seconds. Each admin has a
-//! replay-protection nonce: a call is rejected with `InvalidNonce` unless
-//! `nonce` is strictly greater than the last accepted one (readable via
-//! `get_delegated_nonce`), and with `ExpiredSignature` once the ledger
-//! timestamp reaches `expiry`. Use this path when the admin key is kept
+//! `allowlist-delegated-v2:<target>:add_to_allowlist:<nonce>:<expiry>:<valid_until_ledger>`,
+//! where `<target>` is the address being allowlisted (strkey), `<nonce>` is a
+//! `u64`, `<expiry>` is a ledger timestamp in seconds and
+//! `<valid_until_ledger>` is the last ledger sequence (inclusive, `u32`) at
+//! which the signature may be submitted. All numbers are base-10 ASCII. Each
+//! admin has a replay-protection nonce: a call is rejected with
+//! `InvalidNonce` unless `nonce` is strictly greater than the last accepted
+//! one (readable via `get_delegated_nonce`), and with `ExpiredSignature` once
+//! the ledger timestamp reaches `expiry` or the ledger sequence passes
+//! `valid_until_ledger`. The ledger bound means a leaked but unsubmitted
+//! signature stops being usable after a short window, so signers should pick
+//! a `valid_until_ledger` only a few hundred ledgers ahead (e.g. ~720 ledgers
+//! ≈ 1 hour at ~5s/ledger). Use this path when the admin key is kept
 //! offline or in cold storage and a relayer pays the fees; use the direct
 //! path (`admin.require_auth()`) whenever the admin can sign the transaction
 //! itself.
@@ -384,8 +390,14 @@ impl AllowlistToken {
     }
 
     /// Add `address` to the allowlist using a signed off-chain authorization
-    /// payload. This path verifies a nonce and expiry before applying the
-    /// allowlist change, so a relayer can submit it on behalf of the admin.
+    /// payload. This path verifies a nonce, a timestamp `expiry` and a
+    /// `valid_until_ledger` bound before applying the allowlist change, so a
+    /// relayer can submit it on behalf of the admin.
+    ///
+    /// Returns `Err(ExpiredSignature)` if `expiry` is not after the current
+    /// ledger timestamp or the current ledger sequence is greater than
+    /// `valid_until_ledger`. Both values are part of the signed payload, so a
+    /// relayer cannot extend them.
     ///
     /// Returns `Err(ContractPaused)` if the contract is currently paused.
     pub fn add_to_allowlist_delegated(
@@ -394,6 +406,7 @@ impl AllowlistToken {
         address: Address,
         nonce: u64,
         expiry: u64,
+        valid_until_ledger: u32,
         signature: BytesN<64>,
     ) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
@@ -401,6 +414,9 @@ impl AllowlistToken {
 
         let now = env.ledger().timestamp();
         if expiry <= now {
+            return Err(Error::ExpiredSignature);
+        }
+        if env.ledger().sequence() > valid_until_ledger {
             return Err(Error::ExpiredSignature);
         }
 
@@ -419,7 +435,14 @@ impl AllowlistToken {
             .get(&DataKey::DelegatedAdminPubKey)
             .ok_or(Error::DelegationNotConfigured)?;
         let action = Symbol::new(&env, "add_to_allowlist");
-        let message = Self::delegated_action_message(&env, &address, &action, nonce, expiry);
+        let message = Self::delegated_action_message(
+            &env,
+            &address,
+            &action,
+            nonce,
+            expiry,
+            valid_until_ledger,
+        );
         match soroban_sdk::env::internal::Env::verify_sig_ed25519(
             &env,
             pubkey.to_object(),
@@ -953,16 +976,17 @@ impl AllowlistToken {
     }
 
     /// Message signed by the delegated admin key:
-    /// `allowlist-delegated-v1:<target>:<action>:<nonce>:<expiry>`.
+    /// `allowlist-delegated-v2:<target>:<action>:<nonce>:<expiry>:<valid_until_ledger>`.
     fn delegated_action_message(
         env: &Env,
         target: &Address,
         action: &Symbol,
         nonce: u64,
         expiry: u64,
+        valid_until_ledger: u32,
     ) -> Bytes {
         let mut message = Bytes::new(env);
-        message.append(&Bytes::from_slice(env, b"allowlist-delegated-v1:"));
+        message.append(&Bytes::from_slice(env, b"allowlist-delegated-v2:"));
         let target_str = target.to_string().to_string();
         message.append(&Bytes::from_slice(env, target_str.as_bytes()));
         message.push_back(b':');
@@ -974,6 +998,9 @@ impl AllowlistToken {
         message.push_back(b':');
         let expiry_str = alloc::format!("{expiry}");
         message.append(&Bytes::from_slice(env, expiry_str.as_bytes()));
+        message.push_back(b':');
+        let valid_until_str = alloc::format!("{valid_until_ledger}");
+        message.append(&Bytes::from_slice(env, valid_until_str.as_bytes()));
         message
     }
 }

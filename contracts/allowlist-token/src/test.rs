@@ -98,9 +98,20 @@ fn assert_budget_within_threshold(measured: (u64, u64), baseline: (u64, u64), la
 
 // ─── Delegated-signature helpers ─────────────────────────────────────────────
 
-fn delegated_message_bytes(env: &Env, target: &Address, nonce: u64, expiry: u64) -> Bytes {
+/// Ledger bound used by tests that don't exercise `valid_until_ledger`.
+fn default_valid_until(env: &Env) -> u32 {
+    env.ledger().sequence() + 1_000
+}
+
+fn delegated_message_bytes(
+    env: &Env,
+    target: &Address,
+    nonce: u64,
+    expiry: u64,
+    valid_until_ledger: u32,
+) -> Bytes {
     let mut message = Bytes::new(env);
-    message.append(&Bytes::from_slice(env, b"allowlist-delegated-v1:"));
+    message.append(&Bytes::from_slice(env, b"allowlist-delegated-v2:"));
     let target_str = target.to_string().to_string();
     message.append(&Bytes::from_slice(env, target_str.as_bytes()));
     message.push_back(b':');
@@ -111,9 +122,13 @@ fn delegated_message_bytes(env: &Env, target: &Address, nonce: u64, expiry: u64)
     message.push_back(b':');
     let expiry_str = expiry.to_string();
     message.append(&Bytes::from_slice(env, expiry_str.as_bytes()));
+    message.push_back(b':');
+    let valid_until_str = valid_until_ledger.to_string();
+    message.append(&Bytes::from_slice(env, valid_until_str.as_bytes()));
     message
 }
 
+/// Sign with the default ledger bound (`default_valid_until`).
 fn sign_delegated_action(
     env: &Env,
     signing_key: &SigningKey,
@@ -121,7 +136,18 @@ fn sign_delegated_action(
     nonce: u64,
     expiry: u64,
 ) -> BytesN<64> {
-    let message = delegated_message_bytes(env, target, nonce, expiry);
+    sign_delegated_action_until(env, signing_key, target, nonce, expiry, default_valid_until(env))
+}
+
+fn sign_delegated_action_until(
+    env: &Env,
+    signing_key: &SigningKey,
+    target: &Address,
+    nonce: u64,
+    expiry: u64,
+    valid_until_ledger: u32,
+) -> BytesN<64> {
+    let message = delegated_message_bytes(env, target, nonce, expiry, valid_until_ledger);
     let sig = signing_key.sign(&message).unwrap();
     BytesN::from_array(env, &sig)
 }
@@ -270,7 +296,7 @@ fn test_budget_regression_allowlist_add_to_allowlist_delegated() {
 
     let mut budget = env.cost_estimate().budget();
     budget.reset_default();
-    client.add_to_allowlist_delegated(&admin, &alice, &1u64, &expiry, &signature);
+    client.add_to_allowlist_delegated(&admin, &alice, &1u64, &expiry, &default_valid_until(&env), &signature);
 
     let measured = (budget.cpu_instruction_cost(), budget.memory_bytes_cost());
     let baseline_path = baseline_path_for_manifest_dir(PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()));
@@ -299,7 +325,7 @@ fn test_delegated_add_costs_more_cpu_than_direct_add() {
     let direct_cpu = budget.cpu_instruction_cost();
 
     budget.reset_default();
-    client.add_to_allowlist_delegated(&admin, &bob, &1u64, &expiry, &signature);
+    client.add_to_allowlist_delegated(&admin, &bob, &1u64, &expiry, &default_valid_until(&env), &signature);
     let delegated_cpu = budget.cpu_instruction_cost();
 
     assert!(
@@ -414,7 +440,7 @@ fn test_delegated_add_to_allowlist_succeeds() {
     let expiry = env.ledger().timestamp() + 60;
     let signature = sign_delegated_action(&env, &signing_key, &alice, 1, expiry);
 
-    client.add_to_allowlist_delegated(&admin, &alice, &1u64, &expiry, &signature);
+    client.add_to_allowlist_delegated(&admin, &alice, &1u64, &expiry, &default_valid_until(&env), &signature);
     assert!(client.is_allowed(&alice));
 }
 
@@ -434,8 +460,8 @@ fn test_delegated_add_to_allowlist_rejects_replay() {
     let expiry = env.ledger().timestamp() + 60;
     let signature = sign_delegated_action(&env, &signing_key, &alice, 1, expiry);
 
-    client.add_to_allowlist_delegated(&admin, &alice, &1u64, &expiry, &signature);
-    let replay = client.try_add_to_allowlist_delegated(&admin, &alice, &1u64, &expiry, &signature);
+    client.add_to_allowlist_delegated(&admin, &alice, &1u64, &expiry, &default_valid_until(&env), &signature);
+    let replay = client.try_add_to_allowlist_delegated(&admin, &alice, &1u64, &expiry, &default_valid_until(&env), &signature);
     assert_eq!(replay, Err(Ok(Error::InvalidNonce)));
     assert!(client.is_allowed(&alice));
 }
@@ -457,7 +483,7 @@ fn test_delegated_add_to_allowlist_rejects_expired_signature() {
     let expiry = 99u64;
     let signature = sign_delegated_action(&env, &signing_key, &alice, 1, expiry);
 
-    let result = client.try_add_to_allowlist_delegated(&admin, &alice, &1u64, &expiry, &signature);
+    let result = client.try_add_to_allowlist_delegated(&admin, &alice, &1u64, &expiry, &default_valid_until(&env), &signature);
     assert_eq!(result, Err(Ok(Error::ExpiredSignature)));
     assert!(!client.is_allowed(&alice));
 }
@@ -482,7 +508,7 @@ fn test_delegated_add_to_allowlist_rejects_non_admin_key() {
     let expiry = env.ledger().timestamp() + 60;
     let signature = sign_delegated_action(&env, &attacker_key, &alice, 1, expiry);
 
-    let result = client.try_add_to_allowlist_delegated(&admin, &alice, &1u64, &expiry, &signature);
+    let result = client.try_add_to_allowlist_delegated(&admin, &alice, &1u64, &expiry, &default_valid_until(&env), &signature);
     assert_eq!(result, Err(Ok(Error::NotAuthorized)));
     assert!(!client.is_allowed(&alice));
 }
@@ -962,7 +988,7 @@ fn test_get_delegated_nonce_returns_last_used_nonce() {
 
     let expiry = env.ledger().timestamp() + 60;
     let signature = sign_delegated_action(&env, &signing_key, &alice, 7, expiry);
-    client.add_to_allowlist_delegated(&admin, &alice, &7u64, &expiry, &signature);
+    client.add_to_allowlist_delegated(&admin, &alice, &7u64, &expiry, &default_valid_until(&env), &signature);
 
     assert_eq!(client.get_delegated_nonce(&admin), 7);
 }
@@ -1327,4 +1353,64 @@ fn test_get_delegated_admin_key_returns_active_key() {
     let rotated = BytesN::from_array(&env, &[7u8; 32]);
     client.set_delegated_admin_key(&admin, &rotated);
     assert_eq!(client.get_delegated_admin_key(), Some(rotated));
+}
+
+// ─── Delegated signature ledger expiry (#765) ────────────────────────────────
+
+fn setup_delegation(env: &Env) -> (Address, SigningKey, AllowlistTokenClient<'_>) {
+    let (admin, _token_id, _contract_id, client) = setup(env);
+    let signing_key = delegated_signing_key();
+    let pubkey = BytesN::from_array(env, &signing_key.verifying_key().to_bytes());
+    client.set_delegated_admin_key(&admin, &pubkey);
+    (admin, signing_key, client)
+}
+
+#[test]
+fn test_delegated_signature_accepted_up_to_valid_until_ledger() {
+    let env = Env::default();
+    let (admin, signing_key, client) = setup_delegation(&env);
+    let alice = Address::generate(&env);
+    env.ledger().set_sequence_number(500);
+    let expiry = env.ledger().timestamp() + 60;
+    let valid_until = 500u32;
+    let signature = sign_delegated_action_until(&env, &signing_key, &alice, 1, expiry, valid_until);
+
+    client.add_to_allowlist_delegated(&admin, &alice, &1u64, &expiry, &valid_until, &signature);
+    assert!(client.is_allowed(&alice));
+}
+
+#[test]
+fn test_delegated_signature_rejected_after_valid_until_ledger() {
+    let env = Env::default();
+    let (admin, signing_key, client) = setup_delegation(&env);
+    let alice = Address::generate(&env);
+    env.ledger().set_sequence_number(100);
+    let expiry = env.ledger().timestamp() + 1_000_000;
+    let valid_until = 200u32;
+    let signature = sign_delegated_action_until(&env, &signing_key, &alice, 1, expiry, valid_until);
+
+    // The leaked signature is submitted after its ledger window closed.
+    env.ledger().set_sequence_number(201);
+    let result = client.try_add_to_allowlist_delegated(
+        &admin, &alice, &1u64, &expiry, &valid_until, &signature,
+    );
+    assert_eq!(result, Err(Ok(Error::ExpiredSignature)));
+    assert!(!client.is_allowed(&alice));
+}
+
+#[test]
+fn test_delegated_valid_until_ledger_is_bound_by_signature() {
+    let env = Env::default();
+    let (admin, signing_key, client) = setup_delegation(&env);
+    let alice = Address::generate(&env);
+    env.ledger().set_sequence_number(100);
+    let expiry = env.ledger().timestamp() + 60;
+    let signature = sign_delegated_action_until(&env, &signing_key, &alice, 1, expiry, 150);
+
+    // A relayer cannot stretch the window by submitting a larger bound.
+    let result = client.try_add_to_allowlist_delegated(
+        &admin, &alice, &1u64, &expiry, &10_000u32, &signature,
+    );
+    assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+    assert!(!client.is_allowed(&alice));
 }

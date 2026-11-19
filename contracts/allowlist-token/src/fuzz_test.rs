@@ -99,9 +99,21 @@ fn setup(env: &Env, key: &SigningKey) -> (Address, AllowlistTokenClient<'_>) {
     (admin, client)
 }
 
+/// Ledger-sequence bound signed into every fuzzed payload. The fuzz cases
+/// don't advance the ledger sequence, so this never trips `ExpiredSignature`
+/// on its own; ledger expiry is covered by the unit tests.
+const VALID_UNTIL: u32 = u32::MAX;
+
 fn sign(env: &Env, key: &SigningKey, target: &Address, nonce: u64, expiry: u64) -> [u8; 64] {
     let action = Symbol::new(env, "add_to_allowlist");
-    let message = AllowlistToken::delegated_action_message(env, target, &action, nonce, expiry);
+    let message = AllowlistToken::delegated_action_message(
+        env,
+        target,
+        &action,
+        nonce,
+        expiry,
+        VALID_UNTIL,
+    );
     key.sign(&message).unwrap()
 }
 
@@ -129,7 +141,7 @@ fn fuzz_delegated_arbitrary_signature_never_authorizes() {
         let expiry = rng.boundary_u64(now);
         let signature = BytesN::from_array(&env, &rng.bytes64());
 
-        match client.try_add_to_allowlist_delegated(&admin, &target, &nonce, &expiry, &signature) {
+        match client.try_add_to_allowlist_delegated(&admin, &target, &nonce, &expiry, &VALID_UNTIL, &signature) {
             Ok(Ok(())) => panic!("arbitrary signature accepted (nonce={nonce}, expiry={expiry})"),
             Ok(Err(e)) => panic!("unexpected conversion error: {e:?}"),
             Err(Ok(e)) => assert!(is_intended_error(e), "unexpected contract error {e:?}"),
@@ -158,7 +170,7 @@ fn fuzz_delegated_signed_requests_follow_expiry_and_nonce_rules() {
             let signature = BytesN::from_array(&env, &sign(&env, &key, &target, nonce, expiry));
 
             let result =
-                client.try_add_to_allowlist_delegated(&admin, &target, &nonce, &expiry, &signature);
+                client.try_add_to_allowlist_delegated(&admin, &target, &nonce, &expiry, &VALID_UNTIL, &signature);
 
             if expiry <= now {
                 assert_eq!(result, Err(Ok(Error::ExpiredSignature)));
@@ -195,14 +207,14 @@ fn fuzz_delegated_tampered_signature_is_rejected_without_state_change() {
         let signature = BytesN::from_array(&env, &raw);
 
         let result =
-            client.try_add_to_allowlist_delegated(&admin, &target, &nonce, &expiry, &signature);
+            client.try_add_to_allowlist_delegated(&admin, &target, &nonce, &expiry, &VALID_UNTIL, &signature);
         assert_eq!(result, Err(Ok(Error::NotAuthorized)), "flipped bit {bit}");
         assert!(!client.is_allowed(&target));
 
         // The rejected attempt must not have consumed the nonce: the untampered
         // signature for the same nonce still works.
         let good = BytesN::from_array(&env, &sign(&env, &key, &target, nonce, expiry));
-        client.add_to_allowlist_delegated(&admin, &target, &nonce, &expiry, &good);
+        client.add_to_allowlist_delegated(&admin, &target, &nonce, &expiry, &VALID_UNTIL, &good);
         assert!(client.is_allowed(&target));
     }
 }
