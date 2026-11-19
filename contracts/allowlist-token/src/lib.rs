@@ -310,6 +310,14 @@ impl AllowlistToken {
         Ok(())
     }
 
+    /// Returns the ed25519 public key currently registered with
+    /// `set_delegated_admin_key`, or `None` if delegation is not configured.
+    pub fn get_delegated_admin_key(env: Env) -> Option<BytesN<32>> {
+        env.storage()
+            .instance()
+            .get(&DataKey::DelegatedAdminPubKey)
+    }
+
     /// Add `address` to the allowlist. Admin-only.
     ///
     /// Granting access is deliberately stricter than revoking it: putting an

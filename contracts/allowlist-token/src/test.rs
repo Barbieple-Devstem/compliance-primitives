@@ -1305,3 +1305,26 @@ fn test_clawback_allowed_while_paused() {
         Some((alice, 5))
     );
 }
+
+// ─── get_delegated_admin_key (#764) ──────────────────────────────────────────
+
+#[test]
+fn test_get_delegated_admin_key_returns_none_before_configuration() {
+    let env = Env::default();
+    let (_admin, _token_id, _contract_id, client) = setup(&env);
+    assert_eq!(client.get_delegated_admin_key(), None);
+}
+
+#[test]
+fn test_get_delegated_admin_key_returns_active_key() {
+    let env = Env::default();
+    let (admin, _token_id, _contract_id, client) = setup(&env);
+
+    let first = BytesN::from_array(&env, &delegated_signing_key().verifying_key().to_bytes());
+    client.set_delegated_admin_key(&admin, &first);
+    assert_eq!(client.get_delegated_admin_key(), Some(first));
+
+    let rotated = BytesN::from_array(&env, &[7u8; 32]);
+    client.set_delegated_admin_key(&admin, &rotated);
+    assert_eq!(client.get_delegated_admin_key(), Some(rotated));
+}

@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **allowlist-token**: `get_delegated_admin_key() -> Option<BytesN<32>>`
+  view returning the ed25519 key set by `set_delegated_admin_key` (#764).
 - **allowlist-token**: Admin-only `clawback(admin, from, amount)` forwarded
   to the underlying SEP-41 token's `clawback`, emitting a `Clawback` event.
   `set_clawback_requires_freeze` / `get_clawback_requires_freeze` optionally
